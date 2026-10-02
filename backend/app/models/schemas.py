@@ -82,6 +82,7 @@ class Service(BaseModel):
     framework: str = "fastapi"
     privilege_level: str = PRIVILEGE_UNKNOWN
     confidence: str = CONFIDENCE_MEDIUM
+    privilege_reason: str = ""
     entry_points: List[str] = Field(default_factory=list)
 
 

@@ -131,6 +131,7 @@ def refine_service_privileges(
 
         # Check if any endpoints have admin or service-level characteristics
         has_admin_ep = any(_is_admin_endpoint(ep) for ep in eps)
+        has_service_ep = any(_is_service_endpoint(ep) for ep in eps)
         has_user_auth = any(ep.authentication for ep in eps)
         all_unauthenticated = all(not ep.authentication for ep in eps)
 
@@ -146,6 +147,9 @@ def refine_service_privileges(
         if has_admin_ep:
             new_privilege = PRIVILEGE_ADMIN
             new_confidence = CONFIDENCE_MEDIUM
+        elif has_service_ep:
+            new_privilege = PRIVILEGE_SERVICE
+            new_confidence = CONFIDENCE_HIGH
         elif has_user_auth:
             current_rank = PRIVILEGE_RANK.get(service.privilege_level, -1)
             user_rank = PRIVILEGE_RANK.get(PRIVILEGE_USER, 1)
@@ -178,4 +182,16 @@ def _is_admin_endpoint(endpoint: Endpoint) -> bool:
         if any(p in check.lower() for p in ["admin", "superuser", "is_admin"]):
             return True
 
+    return False
+
+
+def _is_service_endpoint(endpoint: Endpoint) -> bool:
+    """Check if an endpoint is internal service-level."""
+    route_lower = endpoint.route.lower()
+    if any(p in route_lower for p in ["/internal", "/service", "/rpc", "/private"]):
+        return True
+    for check in endpoint.authorization_checks:
+        check_lower = check.lower()
+        if any(p in check_lower for p in ["service", "service_token", "service_key", "internal"]):
+            return True
     return False

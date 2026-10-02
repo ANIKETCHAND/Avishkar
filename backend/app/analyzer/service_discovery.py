@@ -1,19 +1,13 @@
 """
-Service Discovery Module — Phase 4
+Service Discovery Module — Upgraded
 =====================================
-Groups Python source files into distinct microservice entities based on:
-- Directory structure (each subdirectory with a FastAPI() instance = 1 service)
-- FastAPI() or APIRouter() instantiation points
-- Presence of main.py / app.py / server.py entry points
+Groups Python source files into distinct microservice entities using combined evidence:
+- Directory structure & application boundaries
+- FastAPI() and APIRouter() instantiation points
+- Entry point files (main.py, app.py, server.py)
+- Multi-source explainable privilege inference with confidence ratings and rationale
 
-Assigns:
-- service_id: unique slug
-- name: human-readable service name
-- path: relative root directory
-- privilege_level: inferred from routes and auth patterns
-- entry_points: list of main Python files
-
-SECURITY: Never executes any uploaded code.
+SECURITY: Never executes uploaded code.
 """
 
 from __future__ import annotations
@@ -21,7 +15,7 @@ from __future__ import annotations
 import logging
 import re
 from pathlib import Path
-from typing import Dict, List, Optional, Set
+from typing import Dict, List, Optional, Set, Tuple
 
 from ..models.schemas import (
     Service,
@@ -30,39 +24,30 @@ from ..models.schemas import (
     CONFIDENCE_LOW, CONFIDENCE_MEDIUM, CONFIDENCE_HIGH,
     PRIVILEGE_RANK,
 )
-from .ast_visitor import FileAnalysisResult, SENSITIVE_KEYWORDS
+from .ast_visitor import FileAnalysisResult
 
 logger = logging.getLogger(__name__)
 
-# ─────────────────────────── Constants ────────────────────────────────────
-
-# Files that indicate a service entry point
+# Files indicating service entry points
 ENTRY_POINT_NAMES: frozenset[str] = frozenset({
     "main.py", "app.py", "server.py", "application.py",
     "run.py", "wsgi.py", "asgi.py",
 })
 
-# Admin route patterns for privilege inference
 ADMIN_ROUTE_PATTERNS: List[str] = ["admin", "superuser", "root", "sudo", "manage"]
-
-# Service-level route patterns
-SERVICE_ROUTE_PATTERNS: List[str] = ["internal", "service", "rpc", "grpc", "inter"]
-
-# User-level auth dependency names
+SERVICE_ROUTE_PATTERNS: List[str] = ["internal", "service", "rpc", "grpc", "inter", "private", "system"]
 USER_AUTH_PATTERNS: List[str] = [
-    "get_current_user", "verify_token", "verify_jwt", "oauth2",
-    "httpbearer", "login_required", "authenticated",
+    "get_current_user", "verify_user", "oauth2", "httpbearer",
+    "login_required", "authenticated", "user_claims", "current_user",
 ]
-
-# Service auth patterns
 SERVICE_AUTH_PATTERNS: List[str] = [
     "verify_service", "service_key", "service_token", "internal_auth",
-    "x-service", "api_key",
+    "x-service", "x_service", "api_key", "internal_token", "server_key",
+    "check_token", "header:x_service", "header:x-service", "service_authenticator",
 ]
 
 
 def _slugify(name: str) -> str:
-    """Convert a directory name to a valid service ID slug."""
     name = re.sub(r"[^a-z0-9\-_]", "-", name.lower())
     name = re.sub(r"-+", "-", name).strip("-")
     return name
@@ -70,53 +55,84 @@ def _slugify(name: str) -> str:
 
 def _infer_privilege_level(
     results: List[FileAnalysisResult],
-) -> tuple[str, str]:
+) -> Tuple[str, str, str]:
     """
-    Infer the privilege level of a service from its AST analysis results.
+    Infer privilege level using combined semantic signals.
 
     Returns:
-        Tuple of (privilege_level, confidence).
+        Tuple of (privilege_level, confidence, rationale).
     """
-    has_auth_deps = False
     has_admin_routes = False
     has_service_routes = False
     has_user_auth = False
     has_service_auth = False
-    has_public_only = True
     has_any_auth = False
+    has_public_only = True
+
+    admin_signals: List[str] = []
+    service_signals: List[str] = []
+    user_signals: List[str] = []
 
     for result in results:
+        if result.has_service_credential_params:
+            has_service_auth = True
+            has_any_auth = True
+            has_public_only = False
+            service_signals.append("Service credential parameters declared in service handlers")
+
         for route in result.routes:
             if route.has_authentication:
                 has_any_auth = True
                 has_public_only = False
 
-            # Check route path for admin patterns
             path_lower = route.path.lower()
             if any(p in path_lower for p in ADMIN_ROUTE_PATTERNS):
                 has_admin_routes = True
+                admin_signals.append(f"Route path '{route.path}' contains admin prefix")
             if any(p in path_lower for p in SERVICE_ROUTE_PATTERNS):
                 has_service_routes = True
+                service_signals.append(f"Route path '{route.path}' contains internal service prefix")
 
-            # Check auth dep names
             for dep in route.auth_deps + route.depends:
                 dep_lower = dep.lower()
-                if any(p in dep_lower for p in USER_AUTH_PATTERNS):
-                    has_user_auth = True
-                if any(p in dep_lower for p in SERVICE_AUTH_PATTERNS):
+                if any(p in dep_lower for p in SERVICE_AUTH_PATTERNS) or "service" in dep_lower:
                     has_service_auth = True
+                    service_signals.append(f"Service credential dependency '{dep}'")
+                elif any(p in dep_lower for p in USER_AUTH_PATTERNS) or "user" in dep_lower:
+                    has_user_auth = True
+                    user_signals.append(f"User authentication dependency '{dep}'")
 
-    # Infer privilege
-    if has_admin_routes and has_any_auth:
-        return PRIVILEGE_ADMIN, CONFIDENCE_MEDIUM
-    elif has_service_auth or (has_service_routes and not has_user_auth):
-        return PRIVILEGE_SERVICE, CONFIDENCE_MEDIUM
-    elif has_user_auth or (has_any_auth and not has_service_routes):
-        return PRIVILEGE_USER, CONFIDENCE_HIGH
-    elif has_public_only:
-        return PRIVILEGE_PUBLIC, CONFIDENCE_LOW
-    else:
-        return PRIVILEGE_UNKNOWN, CONFIDENCE_LOW
+            for check in route.authz_checks:
+                check_lower = check.lower()
+                if any(p in check_lower for p in ["admin", "superuser"]):
+                    has_admin_routes = True
+                    admin_signals.append(f"Admin check in handler: '{check}'")
+                elif any(p in check_lower for p in ["service_key", "service_token", "x_service", "x-service"]):
+                    has_service_auth = True
+                    service_signals.append(f"Service credential check: '{check}'")
+                elif any(p in check_lower for p in ["user", "jwt", "owner"]):
+                    has_user_auth = True
+                    user_signals.append(f"User ownership check: '{check}'")
+
+    # Determine privilege with explainable rationale
+    if has_admin_routes and (has_any_auth or has_service_auth):
+        rationale = f"Elevated administrative privilege inferred: {'; '.join(admin_signals[:2])}"
+        return PRIVILEGE_ADMIN, CONFIDENCE_MEDIUM, rationale
+
+    if has_service_auth or has_service_routes:
+        reasons = service_signals if service_signals else ["Internal service routes or service credentials"]
+        rationale = f"Internal service privilege inferred: {'; '.join(reasons[:2])}"
+        return PRIVILEGE_SERVICE, CONFIDENCE_HIGH if has_service_auth else CONFIDENCE_MEDIUM, rationale
+
+    if has_user_auth or has_any_auth:
+        reasons = user_signals if user_signals else ["User-facing routes with user authentication guards"]
+        rationale = f"User privilege boundary inferred: {'; '.join(reasons[:2])}"
+        return PRIVILEGE_USER, CONFIDENCE_HIGH, rationale
+
+    if has_public_only:
+        return PRIVILEGE_PUBLIC, CONFIDENCE_LOW, "No authentication guards detected; endpoints appear publicly accessible."
+
+    return PRIVILEGE_UNKNOWN, CONFIDENCE_LOW, "Insufficient static evidence to definitively classify privilege boundary."
 
 
 def discover_services(
@@ -125,48 +141,27 @@ def discover_services(
 ) -> List[Service]:
     """
     Discover distinct microservices from AST analysis results.
-
-    Strategy:
-    1. Group files by their top-level directory within the workspace.
-    2. A group becomes a service if it contains a FastAPI() instantiation
-       or has an entry point file (main.py, app.py, etc.).
-    3. Single-directory projects are treated as one service.
-
-    Args:
-        ast_results: List of file analysis results from AST parsing.
-        workspace_root: The extracted workspace root path.
-
-    Returns:
-        List of discovered Service objects.
+    Clusters files by directory and FastAPI/APIRouter application instances.
     """
-    # ── Group files by top-level directory ──────────────────────────────────
     groups: Dict[str, List[FileAnalysisResult]] = {}
 
     for result in ast_results:
-        if result.parse_error and not result.routes and not result.app_definitions:
+        if result.parse_error and not result.routes and not result.app_definitions and not result.router_definitions:
             continue
 
         file_path = Path(result.file_path)
-        # Determine the service root directory
-        # If the file is at top level or only 1 level deep, use root
         parts = file_path.parts
 
-        if len(parts) <= 1:
-            service_dir = "."
-        else:
-            service_dir = parts[0]
+        service_dir = "." if len(parts) <= 1 else parts[0]
 
         if service_dir not in groups:
             groups[service_dir] = []
         groups[service_dir].append(result)
 
-    # ── Check if top-level groups should be split further ───────────────────
-    # If a group dir has subdirectories each with their own FastAPI() instance,
-    # split them into separate services.
+    # Sub-directory splitting for multi-service repos under a single folder
     expanded_groups: Dict[str, List[FileAnalysisResult]] = {}
 
     for group_dir, results in groups.items():
-        # Find subdirectory splits — each subdir with its own FastAPI()
         sub_services: Dict[str, List[FileAnalysisResult]] = {}
 
         for result in results:
@@ -184,7 +179,6 @@ def discover_services(
                 sub_services[sub_dir] = []
             sub_services[sub_dir].append(result)
 
-        # Only split if sub-dirs each independently have FastAPI() instances
         has_fastapi_per_subdir = {
             sub: any(r.app_definitions for r in sub_results)
             for sub, sub_results in sub_services.items()
@@ -195,22 +189,19 @@ def discover_services(
         else:
             expanded_groups[group_dir] = results
 
-    # ── Build Service objects ────────────────────────────────────────────────
+    # Build Service objects
     services: List[Service] = []
     seen_ids: Set[str] = set()
 
     for group_dir, results in expanded_groups.items():
-        # Skip groups with no routes AND no FastAPI definitions
-        has_content = any(r.app_definitions or r.routes for r in results)
+        has_content = any(r.app_definitions or r.router_definitions or r.routes for r in results)
         if not has_content:
             continue
 
-        # Service name from directory
         dir_name = Path(group_dir).name if group_dir != "." else "root-service"
         service_name = dir_name.replace("_", "-").replace(" ", "-")
 
         service_id = f"svc_{_slugify(dir_name)}"
-        # Handle duplicates
         counter = 1
         base_id = service_id
         while service_id in seen_ids:
@@ -218,7 +209,6 @@ def discover_services(
             counter += 1
         seen_ids.add(service_id)
 
-        # Find entry points
         entry_points: List[str] = []
         for result in results:
             fname = Path(result.file_path).name
@@ -228,7 +218,7 @@ def discover_services(
                 if result.file_path not in entry_points:
                     entry_points.append(result.file_path)
 
-        privilege_level, confidence = _infer_privilege_level(results)
+        privilege_level, confidence, rationale = _infer_privilege_level(results)
 
         services.append(Service(
             service_id=service_id,
@@ -237,10 +227,8 @@ def discover_services(
             privilege_level=privilege_level,
             confidence=confidence,
             entry_points=entry_points,
+            privilege_reason=rationale,
         ))
 
-    logger.info("Service discovery: found %d services", len(services))
-    for svc in services:
-        logger.debug("  Service: %s (%s) privilege=%s", svc.service_id, svc.name, svc.privilege_level)
-
+    logger.info("Service discovery: identified %d services", len(services))
     return services
