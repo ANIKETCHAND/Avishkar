@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Dict, List, Optional
 
 import pytest
-from tests.helpers import analyze_test_project
+from tests.helpers import analyze_test_project, compare_expected_actual_rules
 
 
 @dataclass
@@ -294,7 +294,9 @@ def get_rate(auth = Depends(check_token)):
 def test_automated_accuracy_evaluation_report(tmp_path):
     """
     Run evaluation benchmark suite and compute rigorous metrics:
-    TP, FP, TN, FN, Precision, Recall, F1, FPR, FNR.
+    - Case-level: TP, FP, TN, FN, Precision, Recall, F1, FPR, FNR
+    - Rule-level: Expected, Detected, Correct, Missing, Unexpected for CD-001..CD-004
+    Uses strict exact rule set matching.
     """
     tp = 0
     fp = 0
@@ -302,37 +304,67 @@ def test_automated_accuracy_evaluation_report(tmp_path):
     fn = 0
 
     results_table = []
+    mismatches = []
+
+    monitored_rules = ["CD-001", "CD-002", "CD-003", "CD-004"]
+    rule_stats = {
+        r: {
+            "expected": 0,
+            "detected": 0,
+            "correct": 0,
+            "missing": 0,
+            "unexpected": 0,
+        }
+        for r in monitored_rules
+    }
 
     for case in BENCHMARK_CORPUS:
         scan = analyze_test_project(case.files, tmp_path, f"eval_{case.name}")
         detected_rules = list(dict.fromkeys(f.rule_id for f in scan.findings))
 
+        comparison = compare_expected_actual_rules(case.expected_rules, detected_rules)
+
         is_positive_case = len(case.expected_rules) > 0
 
-        if is_positive_case:
-            # Positive benchmark case
-            all_expected_found = all(r in detected_rules for r in case.expected_rules)
-            if all_expected_found:
+        if comparison.exact_match:
+            if is_positive_case:
                 tp += 1
-                status = "TP (PASS)"
             else:
-                fn += 1
-                status = f"FN (MISS: expected {case.expected_rules}, got {detected_rules})"
-        else:
-            # Negative benchmark case (expected 0 findings)
-            if len(detected_rules) == 0:
                 tn += 1
-                status = "TN (PASS)"
-            else:
+        else:
+            if comparison.classification == "FP":
                 fp += 1
-                status = f"FP (FAIL: unexpected findings {detected_rules})"
+            elif comparison.classification == "FN":
+                fn += 1
+            else:  # MIXED
+                fp += 1
+                fn += 1
+            mismatches.append(comparison.format_details(case.name))
+
+        # Rule-level accounting
+        for r in monitored_rules:
+            in_expected = r in case.expected_rules
+            in_detected = r in detected_rules
+
+            if in_expected:
+                rule_stats[r]["expected"] += 1
+            if in_detected:
+                rule_stats[r]["detected"] += 1
+
+            if in_expected and in_detected:
+                rule_stats[r]["correct"] += 1
+            elif in_expected and not in_detected:
+                rule_stats[r]["missing"] += 1
+            elif not in_expected and in_detected:
+                rule_stats[r]["unexpected"] += 1
 
         results_table.append({
             "name": case.name,
             "category": case.category,
-            "expected": case.expected_rules,
-            "detected": detected_rules,
-            "outcome": status,
+            "expected": comparison.expected_rules,
+            "detected": comparison.actual_rules,
+            "outcome": comparison.status,
+            "exact_match": comparison.exact_match,
         })
 
     total_cases = len(BENCHMARK_CORPUS)
@@ -347,8 +379,22 @@ def test_automated_accuracy_evaluation_report(tmp_path):
     print("      CONFUSED DEPUTY STATIC ANALYZER — EVALUATION METRICS REPORT")
     print("=" * 80)
     for row in results_table:
-        print(f"[{row['outcome'][:8]}] {row['name']:<45} | Expected: {str(row['expected']):<10} | Got: {str(row['detected'])}")
+        status_tag = "[PASS]  " if row["exact_match"] else "[FAIL]  "
+        print(f"{status_tag} {row['name']:<45} | Expected: {str(row['expected']):<14} | Got: {str(row['detected'])}")
     print("-" * 80)
+
+    if mismatches:
+        print("\n" + "!" * 80)
+        print("                        RULE MISMATCH DETAILS")
+        print("!" * 80)
+        for mismatch in mismatches:
+            print(mismatch)
+            print("-" * 40)
+        print("!" * 80 + "\n")
+
+    print("\n" + "=" * 80)
+    print("                           CASE-LEVEL METRICS")
+    print("=" * 80)
     print(f"Total Benchmark Cases Evaluated : {total_cases}")
     print(f"True Positives (TP)             : {tp}")
     print(f"True Negatives (TN)             : {tn}")
@@ -360,9 +406,20 @@ def test_automated_accuracy_evaluation_report(tmp_path):
     print(f"F1 Score                        : {f1:.4f}")
     print(f"False Positive Rate (FPR)       : {fpr * 100:.2f}%")
     print(f"False Negative Rate (FNR)       : {fnr * 100:.2f}%")
+
+    print("\n" + "=" * 80)
+    print("                           RULE-LEVEL METRICS")
+    print("=" * 80)
+    print(f"{'Rule ID':<10} | {'Expected':<10} | {'Detected':<10} | {'Correct':<10} | {'Missing':<10} | {'Unexpected':<12}")
+    print("-" * 80)
+    for r in monitored_rules:
+        st = rule_stats[r]
+        print(f"{r:<10} | {st['expected']:<10} | {st['detected']:<10} | {st['correct']:<10} | {st['missing']:<10} | {st['unexpected']:<12}")
     print("=" * 80 + "\n")
 
-    # Assert 100% accuracy on the defined benchmark corpus
-    assert fp == 0, f"False positives detected: {[r for r in results_table if 'FP' in r['outcome']]}"
-    assert fn == 0, f"False negatives detected: {[r for r in results_table if 'FN' in r['outcome']]}"
+    # Strict assertions
+    assert len(mismatches) == 0, f"{len(mismatches)} rule mismatch(es) detected:\n" + "\n\n".join(mismatches)
+    assert fp == 0, f"False positives detected: {fp}"
+    assert fn == 0, f"False negatives detected: {fn}"
     assert accuracy == 1.0, f"Expected 100% accuracy on defined corpus, got {accuracy * 100:.2f}%"
+

@@ -185,6 +185,11 @@ def run_cd001(
             if not dst_ep.is_sensitive:
                 continue
 
+            # Unauthenticated target endpoints called without service credentials represent an
+            # unauthenticated route vulnerability (CD-002), not a confused deputy (CD-001).
+            if not has_service_token and not dst_ep.authentication:
+                continue
+
             # Condition 5 & Negative Security: User JWT is forwarded AND validated downstream
             # When service token delegation is NOT present, downstream authentication/authorization suffices.
             if identity_prop == IDENTITY_FORWARDED_USER_JWT and not has_service_token:
@@ -311,12 +316,12 @@ def run_cd002(
             if dst_ep.authentication or dst_ep.authorization_checks:
                 continue
 
-            # CD-002 targets privileged internal endpoints or sensitive state-changing operations
-            is_internal_or_sensitive = (
+            # CD-002 specifically targets internal/admin route paths or privileged internal services
+            is_internal_or_privileged = (
                 any(p in dst_ep.route.lower() for p in ["/internal", "/service", "/rpc", "/private", "/admin"])
-                or dst_ep.is_sensitive
+                or dst_service.privilege_level in (PRIVILEGE_SERVICE, PRIVILEGE_ADMIN)
             )
-            if not is_internal_or_sensitive:
+            if not is_internal_or_privileged:
                 continue
 
             if not call_graph.is_reachable_from_public(dst_service.service_id):
@@ -520,12 +525,11 @@ def run_cd004(
             if not all_unauthenticated:
                 continue
 
-            # Downstream must expose sensitive, internal, or privileged functionality to be vulnerable under CD-004
-            has_privileged_or_sensitive = any(
-                e.is_sensitive or any(p in e.route.lower() for p in ["/internal", "/admin", "/service", "/private"])
-                for e in dst_eps
-            )
-            if not has_privileged_or_sensitive:
+            # Downstream must expose sensitive state-changing operations to represent an authentic
+            # Gateway-Only Authorization Policy vulnerability (CD-004), leaving critical state mutations
+            # unprotected within the internal microservice perimeter.
+            has_sensitive_ops = any(e.is_sensitive for e in dst_eps)
+            if not has_sensitive_ops:
                 continue
 
             fingerprint = _make_finding_fingerprint(

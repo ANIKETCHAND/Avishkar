@@ -15,7 +15,7 @@ from dataclasses import dataclass
 from typing import Dict, List, Optional
 import pytest
 
-from tests.helpers import analyze_test_project
+from tests.helpers import analyze_test_project, compare_expected_actual_rules
 
 
 @dataclass
@@ -538,17 +538,11 @@ class TestAccuracyCorpus:
         scan = analyze_test_project(scenario.files, tmp_path, f"acc_{scenario.id}")
         detected_rules = list(dict.fromkeys(f.rule_id for f in scan.findings))
 
-        if scenario.expected_secure:
-            assert len(detected_rules) == 0, (
-                f"False positive in secure/adversarial scenario '{scenario.name}'! "
-                f"Expected 0 findings, got: {detected_rules}"
-            )
-        else:
-            for exp_rule in scenario.expected_rules:
-                assert exp_rule in detected_rules, (
-                    f"False negative in scenario '{scenario.name}'! "
-                    f"Expected rule {exp_rule} not found in: {detected_rules}"
-                )
+        res = compare_expected_actual_rules(scenario.expected_rules, detected_rules)
+        assert res.exact_match, (
+            f"Rule mismatch in scenario '{scenario.name}':\n"
+            f"{res.format_details(scenario.name)}"
+        )
 
     def test_full_corpus_confusion_matrix(self, tmp_path):
         """Compute full statistical confusion matrix over all benchmark scenarios."""
@@ -560,17 +554,21 @@ class TestAccuracyCorpus:
         for scenario in ACCURACY_BENCHMARK_CORPUS:
             scan = analyze_test_project(scenario.files, tmp_path, f"matrix_{scenario.id}")
             detected_rules = list(dict.fromkeys(f.rule_id for f in scan.findings))
+            res = compare_expected_actual_rules(scenario.expected_rules, detected_rules)
 
-            if not scenario.expected_secure:
-                if all(r in detected_rules for r in scenario.expected_rules):
+            if res.exact_match:
+                if len(scenario.expected_rules) > 0:
                     tp += 1
                 else:
-                    fn += 1
-            else:
-                if len(detected_rules) == 0:
                     tn += 1
-                else:
+            else:
+                if res.classification == "FP":
                     fp += 1
+                elif res.classification == "FN":
+                    fn += 1
+                else:  # MIXED
+                    fp += 1
+                    fn += 1
 
         total = len(ACCURACY_BENCHMARK_CORPUS)
         precision = tp / (tp + fp) if (tp + fp) > 0 else 1.0
@@ -588,3 +586,4 @@ class TestAccuracyCorpus:
         assert f1 == 1.0, f"F1 score expected 1.0, got {f1}"
         assert fpr == 0.0, f"False positive rate expected 0.0, got {fpr}"
         assert fnr == 0.0, f"False negative rate expected 0.0, got {fnr}"
+
