@@ -96,7 +96,14 @@ if dist_dir:
 
     @app.get("/", include_in_schema=False)
     async def serve_spa_root():
-        return FileResponse(dist_dir / "index.html")
+        return FileResponse(
+            dist_dir / "index.html",
+            headers={
+                "Cache-Control": "no-cache, no-store, must-revalidate",
+                "Pragma": "no-cache",
+                "Expires": "0",
+            },
+        )
 
     @app.exception_handler(404)
     async def spa_fallback(request: Request, exc):
@@ -104,7 +111,14 @@ if dist_dir:
         if path.startswith("/api/") or path in ("/docs", "/openapi.json", "/redoc"):
             return JSONResponse(status_code=404, content={"detail": "Not Found"})
         if dist_dir and (dist_dir / "index.html").exists():
-            return FileResponse(dist_dir / "index.html")
+            return FileResponse(
+                dist_dir / "index.html",
+                headers={
+                    "Cache-Control": "no-cache, no-store, must-revalidate",
+                    "Pragma": "no-cache",
+                    "Expires": "0",
+                },
+            )
         return JSONResponse(status_code=404, content={"detail": "Not Found"})
 else:
     @app.get("/", include_in_schema=False)
