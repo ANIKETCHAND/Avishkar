@@ -5,6 +5,7 @@
 import React, { useCallback, useState, useRef } from 'react';
 import { Upload, Shield, AlertTriangle, CheckCircle, Loader2, ChevronRight } from 'lucide-react';
 import { uploadScan, runDemoScan, ApiError } from '../utils/api';
+import { optimizeZipFile } from '../utils/zipOptimizer';
 import type { ScanResult } from '../types';
 
 interface UploadPanelProps {
@@ -60,10 +61,31 @@ export function UploadPanel({ onScanComplete }: UploadPanelProps) {
   const startScan = async () => {
     if (!selectedFile) return;
     setIsScanning(true);
-    setScanLabel(`Analyzing ${selectedFile.name}...`);
     setError(null);
     try {
-      const result = await uploadScan(selectedFile);
+      let fileToUpload = selectedFile;
+
+      // If file exceeds 2 MB, strip non-code files (datasets, images, binaries) to stay within Vercel's 4.5 MB payload limit
+      if (selectedFile.size > 2 * 1024 * 1024) {
+        setScanLabel('Filtering non-code files & datasets...');
+        const opt = await optimizeZipFile(selectedFile);
+        if (opt.wasOptimized) {
+          const origMb = (opt.originalSize / (1024 * 1024)).toFixed(1);
+          const optMb = (opt.optimizedSize / (1024 * 1024)).toFixed(1);
+          setScanLabel(`Optimized (${origMb} MB → ${optMb} MB). Analyzing...`);
+          fileToUpload = opt.file;
+        }
+      }
+
+      if (fileToUpload.size > 4.5 * 1024 * 1024) {
+        throw new Error(
+          `Archive contains ${(fileToUpload.size / (1024 * 1024)).toFixed(1)} MB of code, which exceeds Vercel Serverless Function limit (4.5 MB). ` +
+          `Please run the detector on localhost (which supports up to 50 MB archives) or remove non-microservice folders.`
+        );
+      }
+
+      setScanLabel(`Analyzing ${selectedFile.name}...`);
+      const result = await uploadScan(fileToUpload);
       onScanComplete(result);
     } catch (e) {
       handleError(e);
@@ -131,12 +153,19 @@ export function UploadPanel({ onScanComplete }: UploadPanelProps) {
               <p className="text-slate-500 text-sm mt-1">
                 {(selectedFile.size / (1024 * 1024)).toFixed(2)} MB · Click to change
               </p>
-              <button
-                className="mt-2 text-xs text-slate-500 hover:text-slate-400 underline"
-                onClick={(e) => { e.stopPropagation(); setSelectedFile(null); }}
-              >
-                Clear
-              </button>
+              {selectedFile.size > 2 * 1024 * 1024 && (
+                <div className="mt-2 inline-flex items-center gap-1.5 px-3 py-1 rounded-full bg-blue-500/10 border border-blue-500/20 text-xs text-blue-400">
+                  <span>⚡ Large archive: non-code files & datasets will be automatically filtered</span>
+                </div>
+              )}
+              <div>
+                <button
+                  className="mt-2 text-xs text-slate-500 hover:text-slate-400 underline"
+                  onClick={(e) => { e.stopPropagation(); setSelectedFile(null); }}
+                >
+                  Clear
+                </button>
+              </div>
             </div>
           ) : (
             <div>

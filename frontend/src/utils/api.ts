@@ -16,6 +16,13 @@ export class ApiError extends Error {
 
 async function handleResponse<T>(res: Response): Promise<T> {
   if (!res.ok) {
+    if (res.status === 413) {
+      throw new ApiError(
+        413,
+        'Archive exceeds Vercel Serverless limit (4.5 MB). ' +
+        'Please remove large datasets, model weights, or media files from the ZIP, or run the detector on localhost for archives up to 50 MB.'
+      );
+    }
     let detail = `HTTP ${res.status}`;
     try {
       const body = await res.json();
