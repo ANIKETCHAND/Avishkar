@@ -16,6 +16,9 @@ import uuid
 # Enumerations (using plain string literals for Pydantic v2 compatibility)
 # ---------------------------------------------------------------------------
 
+# Engine version
+ANALYSIS_ENGINE_VERSION = "2.0.0"
+
 # Privilege levels
 PRIVILEGE_PUBLIC = "PUBLIC"
 PRIVILEGE_USER = "USER"
@@ -70,7 +73,7 @@ class Project(BaseModel):
     framework: str = "fastapi"
     total_files: int = 0
     scan_status: str = STATUS_PENDING
-    analysis_version: str = "1.0.0"
+    analysis_version: str = ANALYSIS_ENGINE_VERSION
 
 
 class Service(BaseModel):
@@ -99,6 +102,9 @@ class Endpoint(BaseModel):
     authentication: bool = False
     authorization_checks: List[str] = Field(default_factory=list)
     is_sensitive: bool = False
+    authn_state: str = "AUTHENTICATION_UNKNOWN"
+    authz_state: str = "AUTHORIZATION_UNKNOWN"
+    authz_type: str = "UNKNOWN"
 
 
 class ServiceCall(BaseModel):
@@ -114,6 +120,8 @@ class ServiceCall(BaseModel):
     call_type: str = "HTTP_CLIENT"
     identity_propagation: str = IDENTITY_UNKNOWN
     passed_headers: List[str] = Field(default_factory=list)
+    provenance_state: str = "UNKNOWN"
+    matched_endpoint_id: Optional[str] = None
 
 
 class PrivilegeBoundary(BaseModel):
@@ -145,6 +153,9 @@ class Finding(BaseModel):
     privilege_observations: List[str] = Field(default_factory=list)
     limitations: str = ""
     remediation: str = ""
+    why_matched: str = ""
+    why_secure_rejected: str = ""
+    security_controls_found: List[str] = Field(default_factory=list)
 
 
 class GraphNode(BaseModel):
@@ -183,6 +194,7 @@ class ScanResult(BaseModel):
     summary_stats: Dict[str, int] = Field(default_factory=dict)
     scan_duration_seconds: Optional[float] = None
     warnings: List[str] = Field(default_factory=list)
+    engine_version: str = ANALYSIS_ENGINE_VERSION
 
 
 # ---------------------------------------------------------------------------

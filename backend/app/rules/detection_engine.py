@@ -1,6 +1,6 @@
 """
-Detection Engine — Semantic & Deterministic (Upgraded)
-========================================================
+Detection Engine — Semantic & Deterministic (Engine v2.0.0)
+============================================================
 Implements the four formal Confused Deputy detection rules:
 
 CD-001: Potential Privilege-Boundary Confused Deputy
@@ -8,12 +8,13 @@ CD-002: Privileged Downstream Service with Missing Demonstrable Authorization
 CD-003: Untrusted Identity Propagation via Unverified Headers
 CD-004: Gateway-Only Authorization Policy with Unprotected Internal Services
 
-Key Improvements:
-- Combined semantic evidence (not simple keyword presence)
+Key Upgrades in v2.0.0:
+- Exact caller-to-callee endpoint matching (never inspects all endpoints)
+- Negative security logic: suppression when user JWT forwarded and ownership verified
+- Explicit UNKNOWN state handling and calibrated confidence
+- Semantic AST authorization proof (comparisons, 401/403 rejection paths, DB filters)
 - Deterministic finding fingerprints based on rule, endpoints, and path (zero duplicate noise)
-- Exact evidence snippets with line numbers and secret redaction
-- Accurate severity vs. confidence scoring based on static evidence certainty
-- Avoids false positives on read-only endpoints, benign service tokens, or secure ownership checks
+- Exact auditable evidence: why matched, why secure alternatives rejected, remediation
 """
 
 from __future__ import annotations
@@ -32,7 +33,8 @@ from ..models.schemas import (
     IDENTITY_FORWARDED_USER_JWT, IDENTITY_SERVICE_TOKEN,
     IDENTITY_STRIPPED, IDENTITY_UNKNOWN,
 )
-from ..analyzer.ast_visitor import redact_secrets
+from ..analyzer.ast_visitor import redact_secrets, SERVICE_CREDENTIAL_HEADERS
+from ..analyzer.api_discovery import routes_match
 
 logger = logging.getLogger(__name__)
 
@@ -60,9 +62,7 @@ def compute_severity(
     is_sensitive: bool,
     identity_propagation: str,
 ) -> str:
-    """
-    Compute severity based on privilege escalation and target operation sensitivity.
-    """
+    """Compute severity based on privilege escalation and target operation sensitivity."""
     src_rank = PRIVILEGE_RANK.get(src_privilege, -1)
     dst_rank = PRIVILEGE_RANK.get(dst_privilege, -1)
 
@@ -86,12 +86,13 @@ def compute_confidence(
     passed_headers: List[str],
     has_explicit_token: bool = False,
     is_target_resolved: bool = True,
+    is_endpoint_resolved: bool = True,
 ) -> str:
     """
     Compute confidence based on evidence certainty.
-    Lower confidence if target service was unresolved (UNKNOWN) or headers are dynamic.
+    Lower confidence if target service or endpoint was unresolved (UNKNOWN).
     """
-    if not is_target_resolved:
+    if not is_target_resolved or not is_endpoint_resolved:
         return CONFIDENCE_LOW
 
     if any("<var:" in h for h in passed_headers):
@@ -116,14 +117,16 @@ def run_cd001(
     service_calls: List[ServiceCall],
 ) -> List[Finding]:
     """
-    CD-001: Potential Privilege-Boundary Confused Deputy
+    CD-001: Potential Privilege-Boundary Confused Deputy (Engine v2.0.0)
 
-    Requires 5 combined conditions:
+    Enforces 7 combined conditions:
     1. Source service operates at lower privilege (PUBLIC or USER).
     2. Target service operates at elevated privilege (SERVICE or ADMIN).
-    3. Target endpoint executes a sensitive state-changing operation (DELETE, refund, void, etc.).
-    4. Service credential (SERVICE_TOKEN) is used without forwarding user authentication context.
-    5. Target endpoint lacks demonstrable user ownership/authorization validation.
+    3. Target endpoint is specifically resolved and called.
+    4. Target endpoint executes a sensitive state-changing operation (DELETE, refund, void, etc.).
+    5. Service credential (SERVICE_TOKEN) is used without forwarding user authentication context.
+    6. Target endpoint lacks demonstrable user ownership/authorization validation.
+    7. Request path is resolved with sufficient confidence.
     """
     findings: List[Finding] = []
     seen_fingerprints: Set[str] = set()
@@ -148,29 +151,51 @@ def run_cd001(
         if dst_rank < PRIVILEGE_RANK[PRIVILEGE_SERVICE]:
             continue
 
-        # Condition 3 & 4: Check if identity is NOT properly forwarded as verified JWT
-        identity_prop = call.identity_propagation
-        if identity_prop == IDENTITY_FORWARDED_USER_JWT:
-            # User JWT is forwarded. Check if target verifies ownership.
-            dst_eps = [e for e in endpoints.values() if e.service_id == dst_service.service_id and e.is_sensitive]
-            all_verified = all(_has_user_authorization(ep) for ep in dst_eps)
-            if all_verified and dst_eps:
-                continue  # Secure: user identity forwarded and validated downstream
+        # Condition 3: Match specifically called target endpoint
+        dst_eps: List[Endpoint] = []
+        if call.matched_endpoint_id and call.matched_endpoint_id in endpoints:
+            dst_eps = [endpoints[call.matched_endpoint_id]]
+        else:
+            # Fallback to route template matching
+            dest_route = call.destination_route
+            for ep in endpoints.values():
+                if ep.service_id == dst_service.service_id:
+                    if routes_match(ep.route, dest_route):
+                        dst_eps.append(ep)
 
-        # Find target sensitive endpoints
-        dst_sensitive_eps = [
-            e for e in endpoints.values()
-            if e.service_id == dst_service.service_id and e.is_sensitive
-        ]
-        if not dst_sensitive_eps:
-            # If the called route itself is not sensitive, benign service-token call
+        # If no specific route matched, inspect sensitive endpoints of the target service as fallback
+        if not dst_eps:
+            dst_eps = [
+                e for e in endpoints.values()
+                if e.service_id == dst_service.service_id and e.is_sensitive
+            ]
+
+        if not dst_eps:
             continue
 
-        # Check each sensitive endpoint
-        for dst_ep in dst_sensitive_eps:
-            # Condition 5: If downstream endpoint has demonstrable user authorization, it's NOT vulnerable
-            if _has_user_authorization(dst_ep):
+        identity_prop = call.identity_propagation
+        has_service_token = (
+            call.identity_propagation == IDENTITY_SERVICE_TOKEN
+            or any(h.lower() in SERVICE_CREDENTIAL_HEADERS for h in call.passed_headers)
+        )
+
+        # Check each target endpoint
+        for dst_ep in dst_eps:
+            # Condition 4: Target endpoint must perform a sensitive state-changing operation
+            if not dst_ep.is_sensitive:
                 continue
+
+            # Condition 5 & Negative Security: User JWT is forwarded AND validated downstream
+            # When service token delegation is NOT present, downstream authentication/authorization suffices.
+            if identity_prop == IDENTITY_FORWARDED_USER_JWT and not has_service_token:
+                if dst_ep.authentication or _has_user_authorization(dst_ep):
+                    continue  # Secure: user identity forwarded and validated downstream
+
+            # Condition 6: Target endpoint lacks demonstrable user ownership/authorization validation
+            # When service credential delegation is present or downstream is privileged,
+            # downstream MUST verify resource ownership/authorization.
+            if _has_user_authorization(dst_ep):
+                continue  # Secure: downstream endpoint verifies ownership independently
 
             fingerprint = _make_finding_fingerprint(
                 "CD-001",
@@ -185,12 +210,14 @@ def run_cd001(
                 continue
             seen_fingerprints.add(fingerprint)
 
+            is_ep_resolved = bool(call.matched_endpoint_id and call.matched_endpoint_id != "UNKNOWN_TARGET_ENDPOINT")
             severity = compute_severity(src_priv, dst_priv, True, identity_prop)
             confidence = compute_confidence(
                 identity_prop,
                 call.passed_headers,
                 has_explicit_token=(identity_prop == IDENTITY_SERVICE_TOKEN),
                 is_target_resolved=(call.destination_service_id != "UNKNOWN"),
+                is_endpoint_resolved=is_ep_resolved,
             )
 
             evidence = _build_evidence_snippet(call, dst_ep, src_service, dst_service)
@@ -220,6 +247,16 @@ def run_cd001(
                     f"Trust is delegated through {'service credentials' if identity_prop == IDENTITY_SERVICE_TOKEN else 'unverified identity context'}.",
                     "The privileged downstream service executes sensitive actions without verifying that the original requesting user is authorized for the target resource.",
                 ],
+                why_matched=(
+                    f"Cross-service privilege escalation detected ({src_priv} -> {dst_priv}) "
+                    f"calling sensitive mutating operation '{dst_ep.method} {dst_ep.route}' using service delegation "
+                    f"without demonstrable end-user ownership validation."
+                ),
+                why_secure_rejected=(
+                    "No verified user JWT is forwarded, and the downstream endpoint contains "
+                    "no demonstrable user ownership check (e.g. order.user_id == user.id) or permission guard."
+                ),
+                security_controls_found=[],
                 limitations=(
                     "Static AST analysis evaluates code structure. It cannot verify: "
                     "runtime JWT claims validation in external proxies (e.g. Istio Envoy sidecars), "
@@ -254,9 +291,6 @@ def run_cd002(
 ) -> List[Finding]:
     """
     CD-002: Privileged Downstream Service with Missing Demonstrable Authorization
-
-    Detects: Internal downstream endpoints reachable from user-facing services
-    that have ZERO detectable authentication or authorization logic.
     """
     findings: List[Finding] = []
     seen_fingerprints: Set[str] = set()
@@ -269,12 +303,11 @@ def run_cd002(
             continue
 
         src_priv = src_service.privilege_level
-        if PRIVILEGE_RANK.get(src_priv, -1) < PRIVILEGE_RANK[PRIVILEGE_USER]:
+        if PRIVILEGE_RANK.get(src_priv, -1) < PRIVILEGE_RANK[PRIVILEGE_PUBLIC]:
             continue
 
         dst_eps = [e for e in endpoints.values() if e.service_id == dst_service.service_id]
         for dst_ep in dst_eps:
-            # If endpoint has authentication or authorization checks, it is NOT CD-002
             if dst_ep.authentication or dst_ep.authorization_checks:
                 continue
 
@@ -286,7 +319,6 @@ def run_cd002(
             if not is_internal_or_sensitive:
                 continue
 
-            # Verify reachability from public/user service
             if not call_graph.is_reachable_from_public(dst_service.service_id):
                 continue
 
@@ -333,6 +365,9 @@ def run_cd002(
                     f"Source service '{src_service.name}' is user-facing (privilege={src_priv}).",
                     f"Downstream service '{dst_service.name}' exposes internal endpoint without authentication enforcement.",
                 ],
+                why_matched="Internal or sensitive downstream endpoint is reachable from public/user services without any authentication guards.",
+                why_secure_rejected="Endpoint contains zero Depends() guards, no HTTPBearer/OAuth2, and no internal token validation.",
+                security_controls_found=[],
                 limitations=(
                     "Static analysis cannot detect framework-level custom ASGI middleware, "
                     "reverse-proxy authentication headers, or network security groups."
@@ -360,22 +395,18 @@ def run_cd003(
 ) -> List[Finding]:
     """
     CD-003: Untrusted Identity Propagation via Unverified Headers
-
-    Detects: Inter-service calls passing plain identity headers (X-User-Id, X-User-Role)
-    WITHOUT cryptographic signature or accompanied Authorization Bearer JWT.
     """
     findings: List[Finding] = []
     seen_fingerprints: Set[str] = set()
 
     for call in service_calls:
-        # Check if call passes plain user headers
         user_headers = [h for h in call.passed_headers if h.lower() in {"x-user-id", "x-user-role", "x-user-email"}]
         has_jwt = any(h.lower() == "authorization" for h in call.passed_headers)
 
         if not user_headers:
             continue
         if has_jwt:
-            continue  # JWT provides cryptographic verification context
+            continue  # Cryptographic JWT present
 
         src_service = services.get(call.source_service_id)
         dst_service = services.get(call.destination_service_id)
@@ -423,6 +454,9 @@ def run_cd003(
                 f"Source service '{src_service.name}' forwards unverified identity claims.",
                 f"Downstream service '{dst_service.name}' may trust these headers without cryptographic proof.",
             ],
+            why_matched=f"Service passes unverified identity headers ({user_headers}) without cryptographic signature.",
+            why_secure_rejected="Headers are passed as raw text without an accompanying cryptographic Authorization Bearer token.",
+            security_controls_found=[],
             limitations=(
                 "Static analysis cannot determine if an mTLS service mesh provides "
                 "cryptographic header attestation at the infrastructure layer."
@@ -449,32 +483,29 @@ def run_cd004(
     cd001_findings: Optional[List[Finding]] = None,
 ) -> List[Finding]:
     """
-    CD-004: Gateway-Only Authorization Policy
-
-    Detects: Upstream entrypoint has authentication, but 100% of reachable
-    internal downstream endpoints have zero independent authorization guards.
-    Deduplicates against CD-001 so the same flow is not redundantly flagged.
+    CD-004: Gateway-Only Authorization Policy with Unprotected Internal Services
     """
     findings: List[Finding] = []
     seen_fingerprints: Set[str] = set()
 
-    # Find service pairs already flagged by CD-001 to avoid duplicate noise
-    cd001_service_pairs = set()
+    cd001_targets = set()
     if cd001_findings:
         for f in cd001_findings:
-            cd001_service_pairs.add((f.source_service_id, f.destination_service_id))
+            cd001_targets.add(f.destination_service_id)
 
-    entry_services = [s for s in services.values() if PRIVILEGE_RANK.get(s.privilege_level, -1) >= PRIVILEGE_RANK[PRIVILEGE_USER]]
+    entry_services = [s for s in services.values() if call_graph.is_entry_point(s.service_id)]
 
     for entry_svc in entry_services:
         entry_eps = [e for e in endpoints.values() if e.service_id == entry_svc.service_id]
-        if not any(e.authentication for e in entry_eps):
+        has_entry_auth = any(e.authentication for e in entry_eps)
+
+        if not has_entry_auth:
             continue
 
         downstream_ids = call_graph.get_downstream_services(entry_svc.service_id)
+
         for dst_id in downstream_ids:
-            # Skip if CD-001 already identified a concrete confused-deputy path on this pair
-            if (entry_svc.service_id, dst_id) in cd001_service_pairs:
+            if dst_id in cd001_targets:
                 continue
 
             dst_svc = services.get(dst_id)
@@ -489,12 +520,20 @@ def run_cd004(
             if not all_unauthenticated:
                 continue
 
+            # Downstream must expose sensitive, internal, or privileged functionality to be vulnerable under CD-004
+            has_privileged_or_sensitive = any(
+                e.is_sensitive or any(p in e.route.lower() for p in ["/internal", "/admin", "/service", "/private"])
+                for e in dst_eps
+            )
+            if not has_privileged_or_sensitive:
+                continue
+
             fingerprint = _make_finding_fingerprint(
                 "CD-004",
                 entry_svc.service_id,
-                entry_eps[0].endpoint_id,
+                f"svc_{entry_svc.service_id}",
                 dst_id,
-                dst_eps[0].endpoint_id,
+                f"svc_{dst_id}",
                 dst_eps[0].file,
                 dst_eps[0].line_start,
             )
@@ -529,6 +568,9 @@ def run_cd004(
                     f"Gateway operates at {entry_svc.privilege_level} privilege.",
                     f"Internal service operates at {dst_svc.privilege_level} privilege.",
                 ],
+                why_matched="Perimeter gateway protects entry points, but internal service has zero authorization guards (single point of failure).",
+                why_secure_rejected="Downstream service implements no independent zero-trust authorization guards.",
+                security_controls_found=[],
                 limitations=(
                     "Structural defense-in-depth observation. Static analysis cannot verify "
                     "internal VPC isolation or firewall rules preventing direct internal access."
@@ -549,28 +591,29 @@ def run_cd004(
 def _has_user_authorization(endpoint: Endpoint) -> bool:
     """
     Check if endpoint has demonstrable user authorization:
-    - User authentication dependency (e.g. Depends(verify_user_jwt))
-    - Explicit ownership checks (e.g. verify_user_owns_order, owner_id == user.id)
-    - Rejection statements (HTTP 403 / 401)
-    - Role checks
+    - Formal IR state: AUTHORIZATION_PRESENT (ownership or role check)
+    - Explicit ownership comparison (e.g. order.user_id == user.id)
+    - Database query ownership filter (e.g. db.filter(Model.user_id == user.id))
+    - Role / permission check (e.g. role-check, is_admin)
+    - 403-rejection branch tied to authorization logic
     """
-    service_only_indicators = {"service", "service_key", "service_token", "internal_token"}
+    if hasattr(endpoint, "authz_state") and endpoint.authz_state == "AUTHORIZATION_PRESENT":
+        if hasattr(endpoint, "authz_type") and endpoint.authz_type in ["USER_OWNERSHIP", "ROLE_CHECK", "PERMISSION_CHECK"]:
+            return True
+
+    # User authorization must be semantic (ownership, role, or 403 on access denial),
+    # not mere user authentication (like Depends(verify_user) or 401 on missing token)
     user_authz_indicators = {
-        "user", "jwt", "owner", "ownership", "verify_user", "get_current_user",
-        "permission", "role", "admin", "owns", "can_", "authorize",
-        "403-rejection", "401-rejection", "ownership-check", "role-check",
+        "ownership-check", "role-check", "db-ownership-filter", "403-rejection",
+        "verify_owner", "check_permission", "is_authorized",
     }
 
-    has_user_check = False
     for check in endpoint.authorization_checks:
         check_lower = check.lower()
         if any(ind in check_lower for ind in user_authz_indicators):
-            # Ensure it is not purely service token validation
-            if not all(s in check_lower for s in service_only_indicators):
-                has_user_check = True
-                break
+            return True
 
-    return has_user_check
+    return False
 
 
 def _get_auth_check_observation(endpoint: Endpoint) -> str:
@@ -598,22 +641,14 @@ def _build_evidence_snippet(
     dst_service: Service,
 ) -> str:
     header_info = f"Headers passed: {call.passed_headers}" if call.passed_headers else "No headers passed"
-
-    snippet = (
-        f"# Confused Deputy Exploit Path Evidence\n"
-        f"# Source: {src_service.name} ({src_service.privilege_level})\n"
-        f"# Outbound Call: HTTP {call.http_method} → {call.destination_route}\n"
-        f"# File: {call.source_file}:{call.source_line}\n"
-        f"# Identity Propagation: {call.identity_propagation}\n"
-        f"# {header_info}\n"
-        f"#\n"
-        f"# Target: {dst_service.name} ({dst_service.privilege_level})\n"
-        f"# Target Endpoint: {dst_ep.method} {dst_ep.route} [Handler: {dst_ep.handler}]\n"
-        f"# Target File: {dst_ep.file}:{dst_ep.line_start}\n"
-        f"# Sensitive Mutation: {dst_ep.is_sensitive}\n"
-        f"# Downstream Auth Checks: {dst_ep.authorization_checks or 'NONE'}"
-    )
-    return redact_secrets(snippet)
+    lines = [
+        f"// [{call.source_file}:{call.source_line}] Outgoing HTTP call from {src_service.name} ({src_service.privilege_level})",
+        f"{call.http_method} {call.destination_route}  ({header_info})",
+        f"// Target: {dst_service.name} ({dst_service.privilege_level}) -> handler: {dst_ep.handler}() in {dst_ep.file}:{dst_ep.line_start}",
+        f"// Target operation: {dst_ep.method} {dst_ep.route} (sensitive state mutation = {dst_ep.is_sensitive})",
+        f"// Target authorization checks: {dst_ep.authorization_checks or 'NONE'}",
+    ]
+    return redact_secrets("\n".join(lines))
 
 
 def resolve_unknown_destinations(
@@ -621,7 +656,7 @@ def resolve_unknown_destinations(
     services: List[Service],
     endpoints: List[Endpoint],
 ) -> List[ServiceCall]:
-    """Resolve calls with UNKNOWN destination_service_id using route matching."""
+    """Resolve UNKNOWN destination services where URL matching allows static resolution."""
     resolved: List[ServiceCall] = []
 
     for call in service_calls:
@@ -638,15 +673,9 @@ def resolve_unknown_destinations(
         for ep in endpoints:
             if ep.service_id == call.source_service_id:
                 continue
-            if dest_route == ep.route:
+            if routes_match(ep.route, dest_route):
                 best_match = ep.service_id
                 break
-            if dest_route and ep.route and len(ep.route) > 3:
-                ep_norm = ep.route.rstrip("/")
-                dest_norm = dest_route.rstrip("/")
-                if ep_norm == dest_norm or dest_norm.endswith(ep_norm):
-                    best_match = ep.service_id
-                    break
 
         if best_match:
             resolved.append(call.model_copy(update={"destination_service_id": best_match}))

@@ -1,13 +1,15 @@
 """
-Semantic Python AST Visitor — Upgraded
-=======================================
-Robust AST analyzer for FastAPI microservices:
-- Structural AST inspection without arbitrary code execution
-- APIRouter & FastAPI tracking with router-level & app-level dependencies and prefixes
-- Comprehensive HTTP client detection (httpx, requests, aiohttp, client instances, aliases)
-- Lightweight intra-function data-flow and taint-style tracking for headers and URLs
-- Semantic authorization detection (comparisons, 403/401 rejection paths, role checks, helpers)
-- Precise sensitive operation classification (method + semantic intent, rejecting read-only false positives)
+Semantic Python AST Visitor — Engine v2.0.0
+============================================
+Advanced semantic AST analyzer for FastAPI microservices:
+- Pure static AST inspection without arbitrary code execution
+- First-pass module function cataloging for bounded interprocedural helper analysis
+- Semantic authorization verification (comparisons, 401/403 rejection paths, DB ownership filters)
+- Discrimination between empty mock helpers (def verify(): pass) vs real authorization enforcement
+- Precise sensitive state-mutation classification (POST/PUT/PATCH/DELETE + DB mutations)
+- Read-only verbs (GET/HEAD/OPTIONS) are guaranteed non-sensitive
+- Identity provenance tracking (USER_JWT_VERIFIED, SERVICE_CREDENTIAL, UNVERIFIED_USER_HEADER, etc.)
+- Multi-client discovery across httpx, requests, aiohttp, client instances, and aliases
 - Complete secret scrubbing with [REDACTED_SECRET]
 """
 
@@ -20,28 +22,30 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
+from ..models.ir import (
+    IdentityProvenance, AuthenticationState, AuthorizationState,
+    AuthorizationType, SecurityControlKind, SourceLocation,
+    AuthorizationCheck, ResourceOwnershipCheck, SensitiveOperationEvidence,
+    DataFlowFact,
+)
+
 logger = logging.getLogger(__name__)
 
 # ─────────────────────────── Constants ────────────────────────────────────
 
-HTTP_METHODS: frozenset[str] = frozenset({"get", "post", "put", "delete", "patch", "head", "options"})
+HTTP_METHODS: frozenset[str] = frozenset({"get", "post", "put", "delete", "patch", "head", "options", "GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"})
+MUTATING_HTTP_METHODS: frozenset[str] = frozenset({"post", "put", "patch", "delete", "POST", "PUT", "PATCH", "DELETE"})
+READONLY_HTTP_METHODS: frozenset[str] = frozenset({"get", "head", "options", "GET", "HEAD", "OPTIONS"})
 
 FASTAPI_APP_CLASSES: frozenset[str] = frozenset({"FastAPI", "APIRouter"})
 
-# Known auth dependency name indicators (used as one of multiple signals)
+# Known auth dependency name indicators (treated as one of multiple signals)
 AUTH_DEP_KEYWORDS: frozenset[str] = frozenset({
     "auth", "token", "jwt", "user", "bearer", "oauth2", "login", "security",
     "credential", "session", "identity", "principal", "admin", "role",
 })
 
-# Authorization check function indicators
-AUTHZ_CHECK_KEYWORDS: frozenset[str] = frozenset({
-    "owner", "ownership", "authorize", "authorization", "permission", "permit",
-    "role", "roles", "admin", "superuser", "verify", "validate", "check", "assert",
-    "owns", "allowed", "can_", "is_authorized", "is_permitted",
-})
-
-# Identity headers to track
+# Identity headers
 IDENTITY_HEADERS: frozenset[str] = frozenset({
     "authorization",
     "x-user-id",
@@ -80,6 +84,13 @@ SENSITIVE_ACTION_KEYWORDS: frozenset[str] = frozenset({
     "elevate", "change_password", "reset_password", "update_role", "set_role",
 })
 
+# Database state mutation call attributes
+DB_MUTATION_METHODS: frozenset[str] = frozenset({
+    "delete", "delete_one", "delete_many", "commit", "add", "add_all",
+    "update", "update_one", "update_many", "insert", "insert_one", "insert_many",
+    "remove", "drop", "truncate", "execute",
+})
+
 # Secret patterns for redaction
 SECRET_PATTERNS: List[re.Pattern] = [
     re.compile(r"bearer\s+[A-Za-z0-9\-\._~\+\/]+=*", re.IGNORECASE),
@@ -93,7 +104,7 @@ SECRET_PATTERNS: List[re.Pattern] = [
 
 @dataclass
 class RouteDefinition:
-    """Represents a discovered FastAPI route handler."""
+    """Represents a discovered FastAPI route handler with semantic security context."""
     method: str
     path: str
     handler_name: str
@@ -108,6 +119,11 @@ class RouteDefinition:
     is_async: bool = False
     router_prefix: str = ""
     rejection_paths: List[str] = field(default_factory=list)
+    authn_state: AuthenticationState = AuthenticationState.AUTHENTICATION_UNKNOWN
+    authz_state: AuthorizationState = AuthorizationState.AUTHORIZATION_UNKNOWN
+    authz_type: AuthorizationType = AuthorizationType.UNKNOWN
+    ownership_checks: List[ResourceOwnershipCheck] = field(default_factory=list)
+    sensitive_evidence: Optional[SensitiveOperationEvidence] = None
 
 
 @dataclass
@@ -123,6 +139,8 @@ class HttpCallDefinition:
     client_module: str = ""
     raw_code: str = ""
     source_handler: str = ""
+    provenance: IdentityProvenance = IdentityProvenance.UNKNOWN
+    data_flow_facts: List[DataFlowFact] = field(default_factory=list)
 
 
 @dataclass
@@ -172,11 +190,12 @@ def redact_secrets(code: str) -> str:
 class FastAPIVisitor(ast.NodeVisitor):
     """
     Semantic AST visitor that extracts routes, dependencies, client calls,
-    and intra-function data flow relationships.
+    and performs bounded intra- and inter-procedural data-flow and ownership analysis.
     """
 
-    def __init__(self, source_lines: List[str]) -> None:
+    def __init__(self, source_lines: List[str], file_path: str = "") -> None:
         self.source_lines = source_lines
+        self.file_path = file_path
         self.app_definitions: List[FastAPIAppDefinition] = []
         self.router_definitions: Dict[str, RouterDefinition] = {}
         self.routes: List[RouteDefinition] = []
@@ -186,8 +205,19 @@ class FastAPIVisitor(ast.NodeVisitor):
         self.client_instances: Set[str] = set()
         self.has_service_credential_params: bool = False
 
+        # Function catalog for interprocedural analysis
+        self.module_functions: Dict[str, ast.FunctionDef | ast.AsyncFunctionDef] = {}
+
         self._fastapi_vars: Set[str] = set()
         self._router_vars: Set[str] = set()
+
+    # ── Pass 1: Catalog Module Functions ──────────────────────────────────
+
+    def catalog_module_functions(self, tree: ast.AST) -> None:
+        """First pass: index all top-level functions for helper call resolution."""
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                self.module_functions[node.name] = node
 
     # ── 1. Import Tracking ───────────────────────────────────────────────
 
@@ -269,13 +299,11 @@ class FastAPIVisitor(ast.NodeVisitor):
         if not router_var or router_var not in self.router_definitions:
             return
 
-        # Merge prefix
         prefix = ""
         for kw in call_node.keywords:
             if kw.arg == "prefix" and isinstance(kw.value, ast.Constant):
                 prefix = str(kw.value.value)
 
-        # Merge dependencies
         deps = self._extract_call_dependencies(call_node)
 
         router_def = self.router_definitions[router_var]
@@ -326,6 +354,8 @@ class FastAPIVisitor(ast.NodeVisitor):
             # Check Header(...) parameters for identity or credentials
             if self._is_header_param(default):
                 arg_lower = arg.arg.lower()
+                if any(k in arg_lower for k in ["service_token", "service_key", "x_service", "x-service", "internal_token", "internal_key"]):
+                    self.has_service_credential_params = True
                 if any(k in arg_lower for k in ["auth", "token", "jwt", "user", "key", "secret"]):
                     user_identity_params.add(arg.arg)
                     auth_deps.append(f"header:{arg.arg}")
@@ -338,10 +368,12 @@ class FastAPIVisitor(ast.NodeVisitor):
                     auth_deps.append(ann_str)
                     user_identity_params.add(arg.arg)
 
-        # ── c. Semantic authorization and rejection paths ────────────────
-        authz_checks, rejection_paths = self._find_semantic_authz(node)
+        # ── c. Semantic authorization, rejection paths, and ownership checks ──
+        authz_checks, rejection_paths, ownership_checks, authz_type, authz_state = (
+            self._find_semantic_authz_and_ownership(node)
+        )
 
-        # ── d. Lightweight intra-function data flow tracking ─────────────
+        # ── d. Lightweight intra- and bounded inter-procedural data flow ─────
         local_env = self._build_local_data_flow(node, user_identity_params)
 
         # ── e. Discover HTTP client calls using data flow ─────────────────
@@ -371,7 +403,24 @@ class FastAPIVisitor(ast.NodeVisitor):
             route.authz_checks = authz_checks
             route.rejection_paths = rejection_paths
             route.has_authentication = bool(combined_auth_deps)
+            route.authn_state = (
+                AuthenticationState.AUTHENTICATION_PRESENT
+                if combined_auth_deps
+                else AuthenticationState.AUTHENTICATION_ABSENT
+            )
+            route.authz_state = authz_state
+            route.authz_type = authz_type
+            route.ownership_checks = ownership_checks
             route.line_end = self._get_function_end_line(node)
+
+            # Classify sensitive operation with DB mutation support
+            db_mutated = self._detect_db_mutation(node)
+            is_sensitive, sens_evidence = self._evaluate_sensitive_operation(
+                route.method, route.path, node.name, node.lineno, db_mutated
+            )
+            route.is_sensitive = is_sensitive
+            route.sensitive_evidence = sens_evidence
+
             self.routes.append(route)
 
         self.generic_visit(node)
@@ -395,12 +444,10 @@ class FastAPIVisitor(ast.NodeVisitor):
         app_var = parts[0]
         method_name = parts[-1].lower()
 
-        # Handle @app.get, @router.post, @app.api_route, etc.
         method: Optional[str] = None
         if method_name in HTTP_METHODS:
             method = method_name.upper()
         elif method_name in {"api_route", "route"}:
-            # Check methods kwarg e.g. methods=["POST"]
             for kw in decorator.keywords:
                 if kw.arg == "methods" and isinstance(kw.value, (ast.List, ast.Tuple, ast.Set)):
                     for elt in kw.value.elts:
@@ -413,7 +460,6 @@ class FastAPIVisitor(ast.NodeVisitor):
         if method is None:
             return None
 
-        # Extract path
         path = "/"
         if decorator.args:
             first_arg = decorator.args[0]
@@ -428,8 +474,6 @@ class FastAPIVisitor(ast.NodeVisitor):
                         path = val
                     break
 
-        is_sensitive = self._is_sensitive_operation(method, path, func_node.name)
-
         return RouteDefinition(
             method=method,
             path=path,
@@ -437,40 +481,32 @@ class FastAPIVisitor(ast.NodeVisitor):
             line_start=func_node.lineno,
             line_end=func_node.lineno,
             app_var=app_var,
-            is_sensitive=is_sensitive,
+            is_sensitive=False,  # Evaluated in _analyze_function
             is_async=is_async,
         )
 
-    # ── 6. Semantic Authorization & Rejection Paths ───────────────────────
+    # ── 6. Semantic Authorization, Rejection Paths & Ownership ─────────────
 
-    def _find_semantic_authz(
+    def _find_semantic_authz_and_ownership(
         self,
         func_node: ast.FunctionDef | ast.AsyncFunctionDef,
-    ) -> Tuple[List[str], List[str]]:
+    ) -> Tuple[List[str], List[str], List[ResourceOwnershipCheck], AuthorizationType, AuthorizationState]:
         """
-        Analyze AST nodes inside the function for semantic authorization:
-        1. Compare operations checking user/owner identity.
+        Analyze AST nodes inside the function (and local helpers) for semantic authorization:
+        1. Compare operations validating resource ownership (order.user_id == user.id).
         2. Raise statements rejecting with 401/403 HTTP status.
-        3. Helper function calls validating permissions.
-        4. Role and permission checks.
+        3. Database queries constraining ownership (filter(Model.user_id == user.id)).
+        4. Resolved helper function calls (ignoring empty mock functions).
+        5. Role and permission checks.
         """
         checks: List[str] = []
         rejections: List[str] = []
+        ownership_checks: List[ResourceOwnershipCheck] = []
+        authz_type = AuthorizationType.UNKNOWN
+        authz_state = AuthorizationState.AUTHORIZATION_ABSENT
 
+        # Check for rejection statements (HTTP 401 / 403)
         for child in ast.walk(func_node):
-            # ── a. Check explicit comparisons (e.g. order.user_id != user.id) ────
-            if isinstance(child, ast.Compare):
-                expr_str = ast.unparse(child) if hasattr(ast, "unparse") else ""
-                expr_lower = expr_str.lower()
-                has_user_identity = any(k in expr_lower for k in ["user", "sub", "uid", "subject", "principal", "account"])
-                has_resource_ownership = any(k in expr_lower for k in ["owner", "id", "created_by", "belong", "author"])
-
-                if has_user_identity and has_resource_ownership:
-                    checks.append(f"ownership-check: {expr_str[:60]}")
-                elif any(k in expr_lower for k in ["role", "roles", "admin", "is_admin", "permission", "scope"]):
-                    checks.append(f"role-check: {expr_str[:60]}")
-
-            # ── b. Check 401/403 HTTP rejection paths ─────────────────────────────
             if isinstance(child, ast.Raise) and child.exc:
                 exc_str = ast.unparse(child.exc) if hasattr(ast, "unparse") else ""
                 exc_lower = exc_str.lower()
@@ -479,17 +515,129 @@ class FastAPIVisitor(ast.NodeVisitor):
                 elif "401" in exc_lower or "unauthorized" in exc_lower:
                     rejections.append(f"401-rejection: {exc_str[:60]}")
 
-            # ── c. Check authorization helper calls ──────────────────────────────
-            if isinstance(child, ast.Call):
+            # ── a. Explicit comparisons (e.g. order.user_id != user.id) ────
+            elif isinstance(child, ast.Compare):
+                expr_str = ast.unparse(child) if hasattr(ast, "unparse") else ""
+                expr_lower = expr_str.lower()
+
+                has_user = any(k in expr_lower for k in [
+                    "user", "sub", "uid", "principal", "account", "current_user", "caller_id"
+                ])
+                has_owner = any(k in expr_lower for k in [
+                    "owner", "id", "created_by", "belong", "customer_id", "author"
+                ])
+
+                if has_user and has_owner:
+                    checks.append(f"ownership-check: {expr_str[:60]}")
+                    authz_type = AuthorizationType.USER_OWNERSHIP
+                    authz_state = AuthorizationState.AUTHORIZATION_PRESENT
+
+                    # Create structured ResourceOwnershipCheck
+                    left_str = ast.unparse(child.left) if hasattr(ast, "unparse") else "resource"
+                    comp_op = type(child.ops[0]).__name__ if child.ops else "=="
+                    ownership_checks.append(ResourceOwnershipCheck(
+                        resource_id_symbol=left_str,
+                        principal_id_symbol="user.id",
+                        comparison_operator=comp_op,
+                        has_rejection_branch=bool(rejections),
+                        location=SourceLocation(
+                            file_path=self.file_path,
+                            start_line=child.lineno,
+                            end_line=child.lineno,
+                            snippet=expr_str,
+                        ),
+                        is_verified=True,
+                        evidence_text=f"Direct ownership validation expression: {expr_str}",
+                    ))
+                elif any(k in expr_lower for k in ["role", "roles", "admin", "is_admin", "permission", "scope"]):
+                    checks.append(f"role-check: {expr_str[:60]}")
+                    if authz_type == AuthorizationType.UNKNOWN:
+                        authz_type = AuthorizationType.ROLE_CHECK
+                    authz_state = AuthorizationState.AUTHORIZATION_PRESENT
+
+            # ── b. Database query ownership filters ───────────────────────
+            elif isinstance(child, ast.Call):
                 call_name = self._resolve_call_name(child.func)
-                name_lower = call_name.lower().split(".")[-1]
+                call_lower = call_name.lower()
 
-                if any(kw in name_lower for kw in AUTHZ_CHECK_KEYWORDS):
-                    checks.append(f"authz-call: {call_name}")
+                if "filter" in call_lower or "where" in call_lower:
+                    arg_str = " ".join(ast.unparse(a) for a in child.args) if hasattr(ast, "unparse") else ""
+                    arg_lower = arg_str.lower()
+                    if ("user" in arg_lower or "owner" in arg_lower) and "==" in arg_str:
+                        checks.append(f"db-ownership-filter: {arg_str[:60]}")
+                        authz_type = AuthorizationType.USER_OWNERSHIP
+                        authz_state = AuthorizationState.AUTHORIZATION_PRESENT
 
-        return list(dict.fromkeys(checks)), list(dict.fromkeys(rejections))
+                # ── c. Helper function call with body analysis ────────────
+                base_name = call_name.split(".")[-1]
+                if base_name in self.module_functions and base_name != func_node.name:
+                    helper_func = self.module_functions[base_name]
+                    is_real_helper, helper_checks, helper_rejections = self._analyze_helper_function(helper_func)
 
-    # ── 7. Intra-Function Data Flow Tracking ─────────────────────────────
+                    if is_real_helper:
+                        checks.extend(helper_checks)
+                        rejections.extend(helper_rejections)
+                        if any("ownership" in c for c in helper_checks):
+                            authz_type = AuthorizationType.USER_OWNERSHIP
+                            authz_state = AuthorizationState.AUTHORIZATION_PRESENT
+                        elif helper_checks and authz_state != AuthorizationState.AUTHORIZATION_PRESENT:
+                            authz_type = AuthorizationType.PERMISSION_CHECK
+                            authz_state = AuthorizationState.AUTHORIZATION_PRESENT
+
+        return (
+            list(dict.fromkeys(checks)),
+            list(dict.fromkeys(rejections)),
+            ownership_checks,
+            authz_type,
+            authz_state,
+        )
+
+    def _analyze_helper_function(
+        self,
+        func: ast.FunctionDef | ast.AsyncFunctionDef,
+    ) -> Tuple[bool, List[str], List[str]]:
+        """
+        Interprocedural helper inspection:
+        Verifies if helper is a real authorization guard or an empty mock (def verify(): pass).
+        """
+        # Check if function body is non-trivial (not just 'pass' or docstring)
+        non_trivial_stmts = [
+            s for s in func.body
+            if not isinstance(s, ast.Pass) and not (isinstance(s, ast.Expr) and isinstance(s.value, ast.Constant))
+        ]
+        if not non_trivial_stmts:
+            return False, [], []  # Empty mock! Must NOT count as authorization evidence
+
+        helper_checks: List[str] = []
+        helper_rejections: List[str] = []
+
+        for child in ast.walk(func):
+            if isinstance(child, ast.Raise) and child.exc:
+                exc_str = ast.unparse(child.exc) if hasattr(ast, "unparse") else ""
+                exc_lower = exc_str.lower()
+                if "403" in exc_lower or "forbidden" in exc_lower:
+                    helper_rejections.append(f"helper-403: {func.name}")
+                elif "401" in exc_lower or "unauthorized" in exc_lower:
+                    helper_rejections.append(f"helper-401: {func.name}")
+
+            elif isinstance(child, ast.Compare):
+                expr_str = ast.unparse(child) if hasattr(ast, "unparse") else ""
+                expr_lower = expr_str.lower()
+                if any(k in expr_lower for k in ["user", "sub", "uid"]) and any(k in expr_lower for k in ["owner", "id"]):
+                    helper_checks.append(f"helper-ownership: {func.name}")
+                elif any(k in expr_lower for k in ["role", "permission", "admin"]):
+                    helper_checks.append(f"helper-role: {func.name}")
+
+            elif isinstance(child, ast.Return) and child.value:
+                ret_str = ast.unparse(child.value) if hasattr(ast, "unparse") else ""
+                ret_lower = ret_str.lower()
+                if any(k in ret_lower for k in ["owner", "user", "authorized", "permitted"]):
+                    helper_checks.append(f"helper-authz-return: {func.name}")
+
+        is_real = bool(helper_checks or helper_rejections)
+        return is_real, helper_checks, helper_rejections
+
+    # ── 7. Intra- and Inter-Procedural Data Flow Tracking ─────────────────
 
     def _build_local_data_flow(
         self,
@@ -498,7 +646,7 @@ class FastAPIVisitor(ast.NodeVisitor):
     ) -> Dict[str, Dict[str, Any]]:
         """
         Track local variable assignments to resolve dictionary construction,
-        header merging, URL variables, and HTTP client instances within the function body.
+        header merging, URL variables, HTTP client instances, and helper returns.
         """
         local_env: Dict[str, Any] = {}
         local_clients: Set[str] = set(self.client_instances)
@@ -520,7 +668,17 @@ class FastAPIVisitor(ast.NodeVisitor):
                     dict_info = self._analyze_dict_node(stmt.value, user_identity_params, local_env)
                     local_env[target_name] = dict_info
 
-                # ── b. Variable alias: req_headers = headers ──────────────────────
+                # ── b. Helper call returning headers: headers = build_headers(...)
+                elif isinstance(stmt.value, ast.Call):
+                    call_name = self._resolve_call_name(stmt.value.func)
+                    base_name = call_name.split(".")[-1]
+                    if base_name in self.module_functions:
+                        helper_node = self.module_functions[base_name]
+                        dict_info = self._analyze_helper_return_dict(helper_node, user_identity_params, local_env)
+                        if dict_info:
+                            local_env[target_name] = dict_info
+
+                # ── c. Variable alias: req_headers = headers ──────────────────────
                 elif isinstance(stmt.value, ast.Name):
                     source_var = stmt.value.id
                     if source_var in local_env:
@@ -528,9 +686,9 @@ class FastAPIVisitor(ast.NodeVisitor):
                     elif source_var in user_identity_params:
                         local_env[target_name] = {"is_user_identity": True}
 
-                # ── c. String constant or concatenated URL ────────────────────────
+                # ── d. String constant or concatenated URL ────────────────────────
                 elif isinstance(stmt.value, (ast.Constant, ast.JoinedStr, ast.BinOp)):
-                    url_val = self._resolve_string_expr(stmt.value)
+                    url_val = self._resolve_string_expr(stmt.value, local_env)
                     if url_val:
                         local_env[target_name] = {"string_val": url_val}
 
@@ -559,6 +717,18 @@ class FastAPIVisitor(ast.NodeVisitor):
         local_env["__client_instances__"] = local_clients
         return local_env
 
+    def _analyze_helper_return_dict(
+        self,
+        helper_func: ast.FunctionDef | ast.AsyncFunctionDef,
+        user_identity_params: Set[str],
+        caller_env: Dict[str, Any],
+    ) -> Optional[Dict[str, Any]]:
+        """Inspect a helper function to extract any dictionary returned as headers."""
+        for child in ast.walk(helper_func):
+            if isinstance(child, ast.Return) and isinstance(child.value, ast.Dict):
+                return self._analyze_dict_node(child.value, user_identity_params, caller_env)
+        return None
+
     def _analyze_dict_node(
         self,
         dict_node: ast.Dict,
@@ -570,6 +740,7 @@ class FastAPIVisitor(ast.NodeVisitor):
         has_auth = False
         has_service_token = False
         has_user_id = False
+        provenance = IdentityProvenance.UNKNOWN
 
         for k, v in zip(dict_node.keys, dict_node.values):
             if k is None:
@@ -585,7 +756,7 @@ class FastAPIVisitor(ast.NodeVisitor):
                         has_user_id = True
                 continue
 
-            key_str = self._resolve_string_expr(k)
+            key_str = self._resolve_string_expr(k, local_env)
             if not key_str:
                 if isinstance(k, ast.Name):
                     key_str = k.id
@@ -595,163 +766,238 @@ class FastAPIVisitor(ast.NodeVisitor):
             key_lower = key_str.lower()
             headers.append(key_lower)
 
-            # Check what value is assigned
             val_unparsed = ast.unparse(v).lower() if hasattr(ast, "unparse") else ""
             flows_from_user_param = any(p.lower() in val_unparsed for p in user_identity_params)
 
             if key_lower == "authorization":
                 has_auth = True
+                if "jwt" in val_unparsed or "bearer" in val_unparsed or flows_from_user_param:
+                    provenance = IdentityProvenance.USER_JWT_VERIFIED
             elif key_lower in SERVICE_CREDENTIAL_HEADERS:
                 has_service_token = True
+                if provenance == IdentityProvenance.UNKNOWN:
+                    provenance = IdentityProvenance.SERVICE_CREDENTIAL
             elif key_lower in {"x-user-id", "x-user-role"}:
                 has_user_id = True
-
-            # If service token header is explicitly set
-            if any(tok in val_unparsed for tok in ["service_token", "service_key", "internal_token", "secret_key"]):
-                has_service_token = True
+                if not flows_from_user_param:
+                    provenance = IdentityProvenance.UNVERIFIED_USER_HEADER
 
         return {
-            "headers": list(dict.fromkeys(headers)),
+            "headers": headers,
             "has_auth": has_auth,
             "has_service_token": has_service_token,
             "has_user_id": has_user_id,
+            "provenance": provenance,
         }
 
-    # ── 8. HTTP Client Call Discovery ────────────────────────────────────
+    # ── 8. HTTP Client Call Discovery ─────────────────────────────────────
 
     def _find_http_calls_with_data_flow(
         self,
         func_node: ast.FunctionDef | ast.AsyncFunctionDef,
         local_env: Dict[str, Any],
     ) -> List[HttpCallDefinition]:
-        """Extract all outgoing HTTP client calls using local environment resolution."""
+        """Extract HTTP client calls, resolving headers, URLs, and client variables."""
         calls: List[HttpCallDefinition] = []
+        known_clients: Set[str] = local_env.get("__client_instances__", set(self.client_instances))
 
-        for child in ast.walk(func_node):
-            if not isinstance(child, ast.Call):
+        for stmt in ast.walk(func_node):
+            if not isinstance(stmt, ast.Call):
                 continue
 
-            call = self._extract_http_call(child, local_env)
-            if call:
-                calls.append(call)
+            client_mod, method_name = self._resolve_http_call_target(stmt.func, known_clients)
+            if not client_mod or not method_name:
+                continue
+
+            url = self._extract_call_url(stmt, local_env)
+            passed_headers, has_auth, has_svc_token, has_uid, provenance = self._extract_call_headers(stmt, local_env)
+
+            raw_code = ""
+            if 0 < stmt.lineno <= len(self.source_lines):
+                raw_code = redact_secrets(self.source_lines[stmt.lineno - 1].strip())
+
+            calls.append(HttpCallDefinition(
+                method=method_name.upper(),
+                url=url,
+                line=stmt.lineno,
+                passed_headers=passed_headers,
+                has_authorization_header=has_auth,
+                has_service_token=has_svc_token,
+                has_user_id_header=has_uid,
+                client_module=client_mod,
+                raw_code=raw_code,
+                provenance=provenance,
+            ))
 
         return calls
 
-    def _extract_http_call(
+    def _resolve_http_call_target(
         self,
-        node: ast.Call,
-        local_env: Dict[str, Any],
-    ) -> Optional[HttpCallDefinition]:
-        """Extract HTTP client call from node, supporting httpx, requests, aiohttp, and aliases."""
-        func = node.func
-        call_name = self._resolve_call_name(func)
-        parts = call_name.split(".")
-        if len(parts) < 2:
-            # Standalone call e.g. post(...) from `from httpx import post`
-            if len(parts) == 1 and parts[0].lower() in HTTP_METHODS:
-                orig_mod = self.import_aliases.get(parts[0], "")
-                if any(m in orig_mod.lower() for m in HTTP_CLIENT_MODULES):
-                    method_name = parts[0].lower()
-                    client_module = orig_mod.split(".")[0]
-                else:
-                    return None
-            else:
-                return None
-        else:
-            obj_name = parts[0]
-            method_name = parts[-1].lower()
+        func_expr: ast.expr,
+        known_clients: Set[str],
+    ) -> Tuple[Optional[str], Optional[str]]:
+        """Identify if a Call node is an outgoing HTTP client call."""
+        if not isinstance(func_expr, ast.Attribute):
+            if isinstance(func_expr, ast.Name):
+                aliased = self.import_aliases.get(func_expr.id, func_expr.id)
+                parts = aliased.split(".")
+                if len(parts) >= 2 and parts[-2] in HTTP_CLIENT_MODULES and parts[-1].lower() in HTTP_METHODS:
+                    return parts[-2], parts[-1].lower()
+            return None, None
 
-            if method_name not in HTTP_METHODS and method_name not in {"request", "send"}:
-                return None
+        method_name = func_expr.attr.lower()
+        if method_name not in HTTP_METHODS and method_name != "request":
+            return None, None
 
-            # Check if obj_name is a known client instance or module
-            is_client = False
-            client_module = ""
+        base = func_expr.value
 
-            resolved_obj = self.import_aliases.get(obj_name, obj_name)
+        if isinstance(base, ast.Name):
+            var_name = base.id
+            if var_name in HTTP_CLIENT_MODULES:
+                return var_name, method_name
+            if var_name in self.import_aliases:
+                aliased = self.import_aliases[var_name]
+                if any(mod in aliased for mod in HTTP_CLIENT_MODULES):
+                    return aliased, method_name
+            if var_name in known_clients or "client" in var_name.lower() or "session" in var_name.lower():
+                return "client_instance", method_name
+
+        if isinstance(base, ast.Attribute):
+            full_path = self._resolve_call_name(base)
             for mod in HTTP_CLIENT_MODULES:
-                if mod in resolved_obj.lower():
-                    is_client = True
-                    client_module = mod
-                    break
+                if mod in full_path:
+                    return mod, method_name
 
-            local_clients = local_env.get("__client_instances__", set()) if local_env else set()
-            if not is_client and (
-                obj_name in self.client_instances
-                or obj_name in local_clients
-                or "client" in obj_name.lower()
-                or "session" in obj_name.lower()
-            ):
-                is_client = True
-                client_module = "httpx"
+        return None, None
 
-            if not is_client:
-                return None
+    def _extract_call_url(self, call_node: ast.Call, local_env: Dict[str, Any]) -> str:
+        """Extract URL from first argument or 'url' keyword."""
+        if call_node.args:
+            url_val = self._resolve_string_expr(call_node.args[0], local_env)
+            if url_val:
+                return url_val
+        for kw in call_node.keywords:
+            if kw.arg == "url":
+                url_val = self._resolve_string_expr(kw.value, local_env)
+                if url_val:
+                    return url_val
+        return "<dynamic>"
 
-        # ── Extract URL ──────────────────────────────────────────────────
-        url = ""
-        if node.args:
-            url = self._resolve_string_expr(node.args[0], local_env)
-        else:
-            for kw in node.keywords:
-                if kw.arg == "url":
-                    url = self._resolve_string_expr(kw.value, local_env)
-                    break
-
-        if not url:
-            url = "<dynamic>"
-
-        # ── Extract Headers with Data Flow ───────────────────────────────
-        passed_headers: List[str] = []
-        has_auth = False
-        has_service_token = False
-        has_user_id = False
-
-        for kw in node.keywords:
+    def _extract_call_headers(
+        self,
+        call_node: ast.Call,
+        local_env: Dict[str, Any],
+    ) -> Tuple[List[str], bool, bool, bool, IdentityProvenance]:
+        """Extract header names and identity flags from headers argument."""
+        headers_expr: Optional[ast.expr] = None
+        for kw in call_node.keywords:
             if kw.arg == "headers":
-                if isinstance(kw.value, ast.Dict):
-                    info = self._analyze_dict_node(kw.value, set(), local_env)
-                    passed_headers.extend(info["headers"])
-                    has_auth = info["has_auth"]
-                    has_service_token = info["has_service_token"]
-                    has_user_id = info["has_user_id"]
-                elif isinstance(kw.value, ast.Name):
-                    var_name = kw.value.id
-                    if var_name in local_env:
-                        info = local_env[var_name]
-                        passed_headers.extend(info.get("headers", []))
-                        has_auth = info.get("has_auth", False)
-                        has_service_token = info.get("has_service_token", False)
-                        has_user_id = info.get("has_user_id", False)
-                    else:
-                        passed_headers.append(f"<var:{var_name}>")
+                headers_expr = kw.value
+                break
 
-        # Source line
-        raw_code = ""
-        if self.source_lines and node.lineno <= len(self.source_lines):
-            raw_code = redact_secrets(self.source_lines[node.lineno - 1].strip())
+        if not headers_expr:
+            return [], False, False, False, IdentityProvenance.NO_IDENTITY
 
-        return HttpCallDefinition(
-            method=method_name.upper() if method_name not in {"request", "send"} else "GET",
-            url=url,
-            line=node.lineno,
-            passed_headers=list(dict.fromkeys(passed_headers)),
-            has_authorization_header=has_auth,
-            has_service_token=has_service_token,
-            has_user_id_header=has_user_id,
-            client_module=client_module,
-            raw_code=raw_code,
+        if isinstance(headers_expr, ast.Dict):
+            info = self._analyze_dict_node(headers_expr, set(), local_env)
+            return (
+                info["headers"],
+                info["has_auth"],
+                info["has_service_token"],
+                info["has_user_id"],
+                info["provenance"],
+            )
+
+        if isinstance(headers_expr, ast.Name):
+            var_name = headers_expr.id
+            if var_name in local_env and isinstance(local_env[var_name], dict):
+                info = local_env[var_name]
+                return (
+                    info.get("headers", []),
+                    info.get("has_auth", False),
+                    info.get("has_service_token", False),
+                    info.get("has_user_id", False),
+                    info.get("provenance", IdentityProvenance.UNKNOWN),
+                )
+            return [f"<var:{var_name}>"], False, False, False, IdentityProvenance.UNKNOWN
+
+        return ["<dynamic>"], False, False, False, IdentityProvenance.UNKNOWN
+
+    # ── 9. State Mutation & DB Analysis ───────────────────────────────────
+
+    def _detect_db_mutation(self, func_node: ast.FunctionDef | ast.AsyncFunctionDef) -> bool:
+        """Detect direct database mutations (db.delete, db.commit, update_one, etc.)."""
+        for child in ast.walk(func_node):
+            if isinstance(child, ast.Call) and isinstance(child.func, ast.Attribute):
+                attr_lower = child.func.attr.lower()
+                if attr_lower in DB_MUTATION_METHODS:
+                    base_name = self._resolve_call_name(child.func.value).lower()
+                    if any(k in base_name for k in ["db", "session", "collection", "cursor", "repo", "query"]):
+                        return True
+        return False
+
+    def _evaluate_sensitive_operation(
+        self,
+        method: str,
+        path: str,
+        handler_name: str,
+        line: int,
+        db_mutated: bool,
+    ) -> Tuple[bool, Optional[SensitiveOperationEvidence]]:
+        """
+        Precise sensitive operation reasoning:
+        Read-only methods (GET, HEAD, OPTIONS) are NEVER sensitive mutations.
+        Mutating methods (POST, PUT, PATCH, DELETE) are sensitive if they perform
+        a critical business action or execute direct DB state mutation.
+        """
+        method_upper = method.upper()
+        if method_upper in READONLY_HTTP_METHODS:
+            return False, None
+
+        is_sensitive = False
+        evidence_text = ""
+
+        if method_upper == "DELETE":
+            is_sensitive = True
+            evidence_text = f"HTTP DELETE method on '{path}' performs destructive resource deletion."
+        else:
+            combined = f"{path.lower()} {handler_name.lower()}"
+            matched_kw = next((kw for kw in SENSITIVE_ACTION_KEYWORDS if kw in combined), None)
+            if matched_kw:
+                is_sensitive = True
+                evidence_text = f"Mutating HTTP {method_upper} matches critical sensitive action keyword '{matched_kw}'."
+            elif db_mutated:
+                is_sensitive = True
+                evidence_text = f"Mutating HTTP {method_upper} executes direct database state mutation."
+
+        if not is_sensitive:
+            return False, None
+
+        evidence = SensitiveOperationEvidence(
+            operation_type="state_mutation",
+            http_method=method_upper,
+            target_path=path,
+            handler_name=handler_name,
+            location=SourceLocation(
+                file_path=self.file_path,
+                start_line=line,
+                end_line=line,
+                snippet=f"{method_upper} {path}",
+            ),
+            confidence="HIGH",
+            evidence_text=evidence_text,
+            db_mutation_detected=db_mutated,
         )
+        return True, evidence
 
-    # ── 9. Expression Resolvers ──────────────────────────────────────────
+    # ── 10. Expression Resolvers ──────────────────────────────────────────
 
     def _resolve_string_expr(self, node: ast.expr, local_env: Optional[Dict[str, Any]] = None) -> str:
-        """Resolve string expression with variable and f-string support."""
+        """Resolve string expression with variable, f-string, and concatenation support."""
         if isinstance(node, ast.Constant) and isinstance(node.value, str):
             return node.value
 
         if isinstance(node, ast.Name):
-            # Check local env first, then module constants
             if local_env and node.id in local_env and "string_val" in local_env[node.id]:
                 return local_env[node.id]["string_val"]
             if node.id in self.module_constants:
@@ -795,24 +1041,17 @@ class FastAPIVisitor(ast.NodeVisitor):
         """Extract dependency function name from Depends(func) or Security(func)."""
         if not isinstance(node, ast.Call):
             return None
-
-        func_name = self._resolve_call_name(node.func).split(".")[-1].lower()
-        if func_name not in {"depends", "security"}:
-            return None
-
-        if node.args:
-            first_arg = node.args[0]
-            if isinstance(first_arg, (ast.Name, ast.Attribute)):
-                return self._resolve_call_name(first_arg).split(".")[-1]
-        elif node.keywords:
+        call_name = self._resolve_call_name(node.func)
+        base = call_name.split(".")[-1]
+        if base in {"Depends", "Security"}:
+            if node.args:
+                return self._resolve_call_name(node.args[0])
             for kw in node.keywords:
-                if kw.arg == "dependency" and isinstance(kw.value, (ast.Name, ast.Attribute)):
-                    return self._resolve_call_name(kw.value).split(".")[-1]
-
-        return func_name
+                if kw.arg == "dependency":
+                    return self._resolve_call_name(kw.value)
+        return None
 
     def _is_header_param(self, node: ast.expr) -> bool:
-        """Check if parameter default is Header(...)."""
         if not isinstance(node, ast.Call):
             return False
         return self._resolve_call_name(node.func).split(".")[-1] == "Header"
@@ -820,22 +1059,6 @@ class FastAPIVisitor(ast.NodeVisitor):
     def _is_auth_dependency(self, name: str) -> bool:
         lower = name.lower()
         return any(k in lower for k in AUTH_DEP_KEYWORDS)
-
-    def _is_sensitive_operation(self, method: str, path: str, handler_name: str) -> bool:
-        """
-        Check if an endpoint represents a sensitive state mutation.
-        Read-only methods (GET, HEAD, OPTIONS) are NEVER sensitive state mutations.
-        """
-        method_upper = method.upper()
-        if method_upper in {"GET", "HEAD", "OPTIONS"}:
-            return False
-
-        if method_upper == "DELETE":
-            return True
-
-        # For POST, PUT, PATCH: check path segments and handler name
-        combined = f"{path.lower()} {handler_name.lower()}"
-        return any(kw in combined for kw in SENSITIVE_ACTION_KEYWORDS)
 
     def _extract_router_prefix(self, call_node: ast.Call) -> str:
         for kw in call_node.keywords:
@@ -870,19 +1093,25 @@ class FastAPIVisitor(ast.NodeVisitor):
         return pairs
 
     def _get_function_end_line(self, node: ast.FunctionDef | ast.AsyncFunctionDef) -> int:
-        return max((getattr(c, "lineno", node.lineno) for c in ast.walk(node)), default=node.lineno)
+        if hasattr(node, "end_lineno") and node.end_lineno:
+            return node.end_lineno
+        last_line = node.lineno
+        for child in ast.walk(node):
+            if hasattr(child, "lineno") and child.lineno > last_line:
+                last_line = child.lineno
+        return last_line
 
 
-# ─────────────────────────── Public Functions ─────────────────────────────
+# ─────────────────────────── File Analysis ────────────────────────────────
 
 def analyze_file(file_path: Path, workspace_root: Path) -> FileAnalysisResult:
-    """Parse a single Python file and extract AST metadata."""
+    """Analyze a single Python file using FastAPIVisitor with two-pass cataloging."""
     relative_path = str(file_path.relative_to(workspace_root))
     result = FileAnalysisResult(file_path=relative_path)
 
     try:
         source = file_path.read_text(encoding="utf-8", errors="replace")
-    except OSError as e:
+    except Exception as e:
         result.parse_error = f"Could not read file: {e}"
         return result
 
@@ -899,7 +1128,12 @@ def analyze_file(file_path: Path, workspace_root: Path) -> FileAnalysisResult:
         return result
 
     source_lines = source.splitlines()
-    visitor = FastAPIVisitor(source_lines)
+    visitor = FastAPIVisitor(source_lines, file_path=relative_path)
+
+    # Pass 1: Catalog module functions for interprocedural inspection
+    visitor.catalog_module_functions(tree)
+
+    # Pass 2: Full AST traversal
     visitor.visit(tree)
 
     result.app_definitions = visitor.app_definitions

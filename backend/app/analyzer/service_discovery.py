@@ -1,11 +1,11 @@
 """
-Service Discovery Module — Upgraded
-=====================================
-Groups Python source files into distinct microservice entities using combined evidence:
-- Directory structure & application boundaries
-- FastAPI() and APIRouter() instantiation points
-- Entry point files (main.py, app.py, server.py)
-- Multi-source explainable privilege inference with confidence ratings and rationale
+Service Discovery Module — Engine v2.0.0
+=========================================
+Discovers microservice boundaries and infers explainable privilege levels:
+- Multi-source clustering: directory structure, entry points, FastAPI/APIRouter instances
+- Docker Compose parsing (docker-compose.yml / compose.yaml) for declared service topologies
+- Multi-signal privilege inference (PUBLIC < USER < SERVICE < ADMIN < UNKNOWN)
+- Stores explainable privilege rationale and calibrated confidence
 
 SECURITY: Never executes uploaded code.
 """
@@ -53,11 +53,54 @@ def _slugify(name: str) -> str:
     return name
 
 
+def _parse_docker_compose_services(workspace_root: Path) -> Dict[str, str]:
+    """
+    Statically inspect docker-compose.yml / compose.yaml to extract service names
+    and their mapped build contexts / paths without third-party dependencies.
+    """
+    compose_files = [
+        workspace_root / "docker-compose.yml",
+        workspace_root / "docker-compose.yaml",
+        workspace_root / "compose.yml",
+        workspace_root / "compose.yaml",
+    ]
+    compose_map: Dict[str, str] = {}
+
+    for comp_file in compose_files:
+        if not comp_file.is_file():
+            continue
+        try:
+            content = comp_file.read_text(encoding="utf-8", errors="replace")
+            # Lightweight regex parser for service declarations and build contexts
+            current_service = None
+            for line in content.splitlines():
+                # Detect service key e.g. "  order-service:"
+                match_svc = re.match(r"^\s{2,4}([a-zA-Z0-9_\-]+):\s*$", line)
+                if match_svc and match_svc.group(1) not in ("version", "services", "networks", "volumes"):
+                    current_service = match_svc.group(1)
+                    continue
+
+                if current_service:
+                    match_build = re.search(r"build:\s*['\"]?([^'\"#\n]+)['\"]?", line)
+                    if match_build:
+                        raw_path = match_build.group(1).strip().lstrip("./")
+                        compose_map[current_service] = raw_path
+                        current_service = None
+        except Exception as e:
+            logger.debug("Could not parse compose file %s: %s", comp_file, e)
+
+    return compose_map
+
+
 def _infer_privilege_level(
     results: List[FileAnalysisResult],
 ) -> Tuple[str, str, str]:
     """
-    Infer privilege level using combined semantic signals.
+    Infer privilege level using combined semantic signals:
+    - Route paths and prefixes
+    - Parameter declarations and annotations
+    - Authentication dependencies
+    - Semantic authorization checks
 
     Returns:
         Tuple of (privilege_level, confidence, rationale).
@@ -78,7 +121,7 @@ def _infer_privilege_level(
             has_service_auth = True
             has_any_auth = True
             has_public_only = False
-            service_signals.append("Service credential parameters declared in service handlers")
+            service_signals.append("Service credential parameter declared in service function signature")
 
         for route in result.routes:
             if route.has_authentication:
@@ -140,9 +183,10 @@ def discover_services(
     workspace_root: Path,
 ) -> List[Service]:
     """
-    Discover distinct microservices from AST analysis results.
-    Clusters files by directory and FastAPI/APIRouter application instances.
+    Discover distinct microservices from AST analysis results and repository metadata.
+    Clusters files by directory, Docker Compose definitions, and FastAPI/APIRouter instances.
     """
+    compose_map = _parse_docker_compose_services(workspace_root)
     groups: Dict[str, List[FileAnalysisResult]] = {}
 
     for result in ast_results:
@@ -200,6 +244,12 @@ def discover_services(
 
         dir_name = Path(group_dir).name if group_dir != "." else "root-service"
         service_name = dir_name.replace("_", "-").replace(" ", "-")
+
+        # Check if Docker Compose declared an explicit name for this path
+        for declared_svc_name, build_path in compose_map.items():
+            if build_path and (build_path == group_dir or group_dir.endswith(build_path)):
+                service_name = declared_svc_name
+                break
 
         service_id = f"svc_{_slugify(dir_name)}"
         counter = 1

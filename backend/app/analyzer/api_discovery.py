@@ -1,24 +1,17 @@
 """
-API & Endpoint Discovery — Upgraded
-=====================================
-Builds Endpoint objects from AST analysis results and service assignments.
-Extracts:
-- HTTP method and route path
-- Handler function name and line range
-- Authentication and authorization checks (including router-level and semantic checks)
-- Sensitive operation flags (method + state-mutation intent)
-
-Discovers ServiceCall objects from outgoing HTTP client calls:
-- Precise endpoint association by handler name & line range
-- Strong URL resolution (constants, f-strings, hostname, route matching)
-- Semantic identity propagation classification
+API & Endpoint Discovery — Engine v2.0.0
+=========================================
+Builds Endpoint and ServiceCall models with precise route matching:
+- Normalized path template matching (/orders/{id} <-> /orders/123)
+- Query string stripping, trailing slash normalization, and prefix handling
+- Strict caller-to-callee endpoint matching (prevents checking 'all endpoints')
+- Precise identity provenance mapping from AST data-flow facts
 """
 
 from __future__ import annotations
 
 import logging
 import re
-import uuid
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -27,18 +20,62 @@ from ..models.schemas import (
     IDENTITY_FORWARDED_USER_JWT, IDENTITY_SERVICE_TOKEN,
     IDENTITY_STRIPPED, IDENTITY_UNKNOWN,
 )
+from ..models.ir import IdentityProvenance
 from .ast_visitor import FileAnalysisResult, RouteDefinition, HttpCallDefinition
 
 logger = logging.getLogger(__name__)
 
 
 def _extract_url_path(url: str) -> str:
-    """Extract path component from URL string."""
+    """Extract path component from URL string, stripping schema, host, and query params."""
     if not url or url == "<dynamic>":
         return url or "/"
-    url = re.sub(r"^https?://[^/]+", "", url)
-    url = re.sub(r"[?#].*$", "", url)
-    return url or "/"
+    clean = re.sub(r"^https?://[^/]+", "", url)
+    clean = re.sub(r"[?#].*$", "", clean)
+    clean = clean.strip()
+    if not clean:
+        return "/"
+    return clean
+
+
+def normalize_route_pattern(route: str) -> str:
+    """
+    Normalize route path for consistent template matching:
+    - Replaces path parameters like {id}, {order_id}, :id with standard token {param}
+    - Strips trailing slash unless path is '/'
+    """
+    clean = _extract_url_path(route)
+    # Replace FastAPI {param_name} or Express :param_name
+    normalized = re.sub(r"\{[a-zA-Z0-9_\-]+\}", "{param}", clean)
+    normalized = re.sub(r":[a-zA-Z0-9_\-]+", "{param}", normalized)
+    normalized = re.sub(r"/+", "/", normalized)
+    if len(normalized) > 1 and normalized.endswith("/"):
+        normalized = normalized[:-1]
+    return normalized
+
+
+def routes_match(declared_route: str, called_route: str) -> bool:
+    """
+    Check if a called URL path matches a declared route template:
+    Example: '/orders/{id}' matches '/orders/123' and '/orders/abc'
+    """
+    decl_norm = normalize_route_pattern(declared_route)
+    call_norm = normalize_route_pattern(called_route)
+
+    if decl_norm == call_norm:
+        return True
+
+    # Build regex from declared route
+    # Replace {param} with regex pattern [^/]+
+    regex_pattern = "^" + re.escape(decl_norm).replace(r"\{param\}", r"[^/]+") + "$"
+    if re.match(regex_pattern, call_norm):
+        return True
+
+    # Suffix matching for stripped prefixes e.g. /v1/refund matching /refund
+    if len(decl_norm) > 3 and (call_norm.endswith(decl_norm) or decl_norm.endswith(call_norm)):
+        return True
+
+    return False
 
 
 def _infer_target_service(
@@ -75,10 +112,36 @@ def _infer_target_service(
         path = _extract_url_path(url)
         if path and path not in ("<dynamic>", "/"):
             for ep in endpoints:
-                if ep.route == path or (len(ep.route) > 3 and path.endswith(ep.route.rstrip("/"))):
+                if routes_match(ep.route, path):
                     return ep.service_id
 
     return "UNKNOWN"
+
+
+def _match_target_endpoint(
+    method: str,
+    called_route: str,
+    target_service_id: str,
+    endpoints: List[Endpoint],
+) -> Optional[Endpoint]:
+    """
+    Find the specific endpoint handler in target service that matches the method and route.
+    Prevents false assumptions over all endpoints in target service.
+    """
+    method_upper = method.upper()
+    target_eps = [e for e in endpoints if e.service_id == target_service_id]
+
+    # Exact method + route match
+    for ep in target_eps:
+        if ep.method == method_upper and routes_match(ep.route, called_route):
+            return ep
+
+    # Method-independent route match fallback
+    for ep in target_eps:
+        if routes_match(ep.route, called_route):
+            return ep
+
+    return None
 
 
 def _make_endpoint_id(service_id: str, method: str, route: str) -> str:
@@ -134,6 +197,9 @@ def discover_endpoints(
                 authentication=route.has_authentication,
                 authorization_checks=list(dict.fromkeys(combined_checks)),
                 is_sensitive=route.is_sensitive,
+                authn_state=route.authn_state.value if hasattr(route, "authn_state") else "AUTHENTICATION_UNKNOWN",
+                authz_state=route.authz_state.value if hasattr(route, "authz_state") else "AUTHORIZATION_UNKNOWN",
+                authz_type=route.authz_type.value if hasattr(route, "authz_type") else "UNKNOWN",
             )
             endpoints.append(endpoint)
 
@@ -146,7 +212,7 @@ def discover_service_calls(
     services: List[Service],
     endpoints: List[Endpoint],
 ) -> List[ServiceCall]:
-    """Build ServiceCall objects linking source endpoints to destination services."""
+    """Build ServiceCall objects linking source endpoints to destination services and endpoints."""
     calls: List[ServiceCall] = []
 
     file_to_service = _build_file_service_map(ast_results, services)
@@ -175,12 +241,16 @@ def discover_service_calls(
 
             # 2. Infer target service with endpoint routes context
             dest_service_id = _infer_target_service(http_call.url, services, endpoints)
+            dest_route = _extract_url_path(http_call.url)
 
-            # 3. Classify identity propagation
+            # 3. Match specific destination endpoint
+            matched_ep = _match_target_endpoint(http_call.method, dest_route, dest_service_id, endpoints)
+            matched_ep_id = matched_ep.endpoint_id if matched_ep else ("UNKNOWN_TARGET_ENDPOINT" if dest_service_id != "UNKNOWN" else None)
+
+            # 4. Classify identity propagation using AST provenance
             identity_prop = _classify_identity_propagation(http_call)
 
             call_id = _make_call_id(source_ep_id or f"ep_{source_service_id}", http_call.line)
-            dest_route = _extract_url_path(http_call.url)
 
             call = ServiceCall(
                 call_id=call_id,
@@ -194,6 +264,8 @@ def discover_service_calls(
                 call_type="HTTP_CLIENT",
                 identity_propagation=identity_prop,
                 passed_headers=http_call.passed_headers,
+                provenance_state=http_call.provenance.value if hasattr(http_call.provenance, "value") else "UNKNOWN",
+                matched_endpoint_id=matched_ep_id,
             )
             calls.append(call)
 
@@ -256,7 +328,6 @@ def _classify_identity_propagation(http_call: HttpCallDefinition) -> str:
     elif not http_call.passed_headers:
         return IDENTITY_STRIPPED
     else:
-        # Check if any passed header is dynamic
         if any("<var:" in h for h in http_call.passed_headers):
             return IDENTITY_UNKNOWN
         return IDENTITY_STRIPPED

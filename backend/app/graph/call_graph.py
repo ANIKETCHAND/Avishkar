@@ -233,6 +233,17 @@ class CallGraph:
             if self.graph.nodes[n].get("node_type") == NODE_TYPE_SERVICE
         ]
 
+    def is_entry_point(self, service_id: str) -> bool:
+        """Check if a service node acts as an entry point (no incoming service calls or user-facing)."""
+        if service_id not in self.graph:
+            return False
+        incoming_service_calls = sum(
+            1 for u, v, d in self.graph.in_edges(service_id, data=True)
+            if d.get("edge_type") == "SERVICE_CALL"
+        )
+        priv = self.graph.nodes[service_id].get("privilege", "UNKNOWN")
+        return incoming_service_calls == 0 or priv in ("PUBLIC", "USER")
+
     def mark_edge_as_risky(self, src: str, dst: str, rule_id: str) -> None:
         """Mark a service call edge as risky for visualization."""
         if self.graph.has_edge(src, dst):
