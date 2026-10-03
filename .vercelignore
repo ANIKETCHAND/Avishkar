@@ -1,0 +1,11 @@
+backend/.pytest_cache
+backend/tests
+backend/storage
+backend/storage/scans
+.git
+.github
+frontend/node_modules
+__pycache__
+*.pyc
+.env
+.env.local

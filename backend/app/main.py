@@ -10,9 +10,11 @@ import logging
 import sys
 from pathlib import Path
 
-from fastapi import FastAPI
+from typing import Optional
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, FileResponse
+from fastapi.staticfiles import StaticFiles
 
 from .api.endpoints import router
 
@@ -69,15 +71,48 @@ app.add_middleware(
 
 # ─────────────────────────── Routes ──────────────────────────────────────
 
+# ─────────────────────────── Routes ──────────────────────────────────────
+
 app.include_router(router)
 
+# Discover frontend dist directory if compiled
+current_file = Path(__file__).resolve()
+possible_dist_dirs = [
+    current_file.parent.parent.parent / "frontend" / "dist",
+    current_file.parent.parent / "frontend" / "dist",
+    Path("frontend/dist"),
+]
 
-@app.get("/", include_in_schema=False)
-async def root():
-    return JSONResponse({
-        "name": "Confused Deputy API Detector",
-        "version": "1.0.0",
-        "docs": "/docs",
-        "health": "/api/v1/health",
-        "description": "Static analyzer for confused deputy authorization risks in FastAPI microservices",
-    })
+dist_dir: Optional[Path] = None
+for d in possible_dist_dirs:
+    if d.exists() and (d / "index.html").exists():
+        dist_dir = d
+        break
+
+if dist_dir:
+    assets_dir = dist_dir / "assets"
+    if assets_dir.exists():
+        app.mount("/assets", StaticFiles(directory=str(assets_dir)), name="assets")
+
+    @app.get("/", include_in_schema=False)
+    async def serve_spa_root():
+        return FileResponse(dist_dir / "index.html")
+
+    @app.exception_handler(404)
+    async def spa_fallback(request: Request, exc):
+        path = request.url.path
+        if path.startswith("/api/") or path in ("/docs", "/openapi.json", "/redoc"):
+            return JSONResponse(status_code=404, content={"detail": "Not Found"})
+        if dist_dir and (dist_dir / "index.html").exists():
+            return FileResponse(dist_dir / "index.html")
+        return JSONResponse(status_code=404, content={"detail": "Not Found"})
+else:
+    @app.get("/", include_in_schema=False)
+    async def root():
+        return JSONResponse({
+            "name": "Confused Deputy API Detector",
+            "version": "1.0.0",
+            "docs": "/docs",
+            "health": "/api/v1/health",
+            "description": "Static analyzer for confused deputy authorization risks in FastAPI microservices",
+        })

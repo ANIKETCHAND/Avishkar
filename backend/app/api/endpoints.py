@@ -42,8 +42,17 @@ router = APIRouter(prefix="/api/v1", tags=["Analysis"])
 
 def _get_storage_dir() -> Path:
     """Get the scan storage directory, creating it if needed."""
-    storage = Path(os.environ.get("SCAN_STORAGE_DIR", "storage/scans"))
-    storage.mkdir(parents=True, exist_ok=True)
+    storage_env = os.environ.get("SCAN_STORAGE_DIR")
+    if storage_env:
+        storage = Path(storage_env)
+    elif os.environ.get("VERCEL"):
+        storage = Path("/tmp/scans")
+    else:
+        storage = Path("storage/scans")
+    try:
+        storage.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        pass
     return storage
 
 
